@@ -8,6 +8,10 @@ htmlcov/
 venv/
 .env
 *.sqlite3
+
+# Claude Code: .claude/settings.json is committed (team-wide permissions).
+# settings.local.json holds personal, machine-specific overrides -- never commit it.
+.claude/settings.local.json
 .DS_Store
 dist/
 build/
