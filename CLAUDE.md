@@ -5,42 +5,35 @@ before making changes.
 
 ## First session in this repo — do this before anything else
 
-This repo was scaffolded (Stage 0 + Stage 1) in a sandboxed environment
-with no network access, so the code was verified with `py_compile`
-only — it has **never actually been run against installed
-dependencies**. That's the very first thing to fix. Do these in order
-and don't skip ahead to feature work until step 4 is green:
+Setup is scripted. Run it and confirm it's green before any feature work:
 
-1. **Create/activate a virtualenv, then install everything:**
-   ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -e ".[dev]"
-   pip install -e plugins/echo_plugin
-   ```
-2. **Sanity-check the CLI loads:**
-   ```bash
-   lookup-cli plugins list
-   ```
-   Expect a table with one row: `echo`. If this fails, the plugin
-   framework itself is broken — fix that before anything else, and
-   don't touch `docs/STAGES.md` checkboxes until it's confirmed.
-3. **Run the two stages that claim to be done and confirm they
-   actually are:**
-   ```bash
-   pytest -m plugin_framework -v
-   pytest -m cache -v
-   pytest --cov=src/lookup_cli --cov-report=term-missing
-   ```
-   If anything fails, that's real signal the scaffold has a bug the
-   no-network sandbox couldn't catch — fix it, and only then flip
-   `docs/STAGES.md`'s "not yet run against installed deps" language to
-   confirmed-green.
-4. **Copy `.env.example` to `.env`** and fill in real `OKTA_ORG_URL` /
-   `OKTA_API_TOKEN` and `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`
-   (both services already have credentials per `docs/STAGES.md`).
-   Leave the Jamf/ABM/allwhere `LOOKUP_CLI_MOCK_*=1` flags as-is — no
-   credentials for those yet.
-5. **Resolve or triage the Open Decisions Log** at the bottom of
+```bash
+./scripts/bootstrap.sh
+source .venv/bin/activate
+```
+
+That creates `.venv`, installs core + every `plugins/*` package, and
+verifies the CLI loads, entry-point discovery works, and all tests pass.
+It exits non-zero if any check fails, and it's re-runnable. If a check
+fails, **stop and report it rather than patching around it** — that means
+the scaffold has a real bug, and `docs/STAGES.md` checkboxes should not
+be flipped until it's fixed.
+
+Expected green state as of 2026-08-19 (verified on Python 3.14.0,
+macOS/arm64): `lookup-cli plugins list` shows two rows — `echo` (built-in)
+and `echo_standalone` (the template package) — and 15 tests pass (13 from
+the root `tests/` run + 2 in `plugins/echo_plugin/tests/`, which the root
+run does not collect; see Stage 0 in `docs/STAGES.md`). Coverage is 87%,
+with `config.py` at 0% because nothing exercises `Settings` yet.
+
+Then:
+
+1. **Fill in `.env`** (bootstrap creates it from `.env.example` if absent)
+   with real `OKTA_ORG_URL` / `OKTA_API_TOKEN` and `JIRA_BASE_URL` /
+   `JIRA_EMAIL` / `JIRA_API_TOKEN` (both services already have
+   credentials per `docs/STAGES.md`). Leave the Jamf/ABM/allwhere
+   `LOOKUP_CLI_MOCK_*=1` flags as-is — no credentials for those yet.
+2. **Resolve or triage the Open Decisions Log** at the bottom of
    `docs/STAGES.md` before starting Stage 2-3 implementation work —
    at minimum, flag which ones block starting vs. which can wait:
    - Per-plugin cache TTLs
@@ -49,14 +42,47 @@ and don't skip ahead to feature work until step 4 is green:
      block Stage 5's mock-first work, but blocks the real-API follow-up
    - Whether per-plugin CLI subcommands stay centralized in `cli.py`
      or move into each plugin package
-6. **Only after 1-5 are done**, pick up the next unchecked task in
+   - Supported Python versions (CI pins 3.11, local dev is on 3.14)
+   - Whether `plugins/*/tests` should be collected by the root `pytest`
+3. **Two known gaps worth closing before Stage 2** (both tracked in
+   `docs/STAGES.md`): the root `pytest` run doesn't collect
+   `plugins/*/tests`, and `config.py`'s `Settings` loader has no tests
+   despite Stage 2 being about to depend on it for Okta credentials.
+4. **Only after the above**, pick up the next unchecked task in
    `docs/STAGES.md` (Stage 2, Okta, is next — real credentials are
    already available for it) and follow the TDD loop in "When picking
    up a task" below.
 
-If any of steps 1-3 fail, stop and report the failure rather than
-patching around it silently — the whole point of this checklist is to
-catch anything the offline scaffolding pass couldn't verify.
+## Running commands in this repo (read this before running anything)
+
+**Always use explicit venv paths: `.venv/bin/pytest`, `.venv/bin/pip`,
+`.venv/bin/lookup-cli`, `.venv/bin/python`.**
+
+Each Bash tool call starts a fresh shell from the user's profile, so a venv
+the developer activated in their own terminal is *not* active here —
+`VIRTUAL_ENV` is unset and `.venv/bin` is not on `PATH`. A bare `pytest` will
+either fail with "command not found" or, worse, silently run a
+globally-installed pytest against an interpreter that has none of this
+project's dependencies and report a misleading result. There is no PATH
+override in `.claude/settings.json` to paper over this: Claude Code's `env`
+block takes literal strings with no variable interpolation, so a committed
+`PATH` would have to hardcode one machine's absolute paths and freeze them.
+The explicit-path convention is the fix.
+
+`.claude/settings.json` (committed) pre-approves the read-only and
+`.venv/bin/*` commands so sessions don't stall on permission prompts, and
+denies reading `.env` — it holds real Okta/Jira tokens, which should never
+land in a transcript. Personal overrides go in `.claude/settings.local.json`,
+which is gitignored.
+
+Two more things worth knowing:
+
+- **Read `docs/STAGES.md` before starting work.** It's the live task board.
+  Stage 2 (Okta) is next and has real credentials. "Start the next unchecked
+  Stage 2 task" is a well-formed request; the TDD loop below then applies.
+- **Nothing mechanically enforces tests-first.** CI runs the suite but won't
+  block implementation that arrived without tests. The discipline in "Ground
+  rules" below is the only thing holding that line.
 
 ## What this project is
 
@@ -110,6 +136,7 @@ docs/CONTRIBUTING.md       TDD workflow, branching, PR checklist
 ## Commands Claude should know
 
 ```bash
+./scripts/bootstrap.sh                    # install + verify everything (start here)
 pip install -e ".[dev]"
 pip install -e plugins/echo_plugin        # and any other plugin packages
 pytest -m plugin_framework                # Stage 0
@@ -122,11 +149,14 @@ lookup-cli lookup <identifier>            # once Stage 7 lands
 
 ## Current state (update this section as stages complete)
 
-- Stage 0 (plugin framework): scaffolded, tests written, needs a real
-  `pip install` + `pytest` run in an environment with network access
-  to confirm green (sandboxed dev environments without network access
-  can only confirm the code compiles, not that tests pass).
-- Stage 1 (cache/data model): scaffolded, same caveat as above.
+- Stage 0 (plugin framework): **verified green** 2026-08-19 — installed
+  and run against real deps on Python 3.14.0. 5 tests pass under
+  `-m plugin_framework`; `lookup-cli plugins list` shows `echo` and
+  `echo_standalone`. Remaining: CI needs one real PR run, and
+  `testpaths` needs fixing to collect per-plugin tests.
+- Stage 1 (cache/data model): **verified green** 2026-08-19 — 8 tests
+  pass under `-m cache`. `cache.py` 100% covered, `config.py` 0%
+  (untested `Settings` loader).
 - Stages 2-8: not started. See `docs/STAGES.md` for the full breakdown.
 - Okta and Jira have real credentials available now; Jamf, ABM, and
   allwhere are mock-first until credentials are provisioned.

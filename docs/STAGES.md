@@ -14,7 +14,10 @@ Legend: **[ ]** not started **[~]** in progress **[x]** done
 ---
 
 ## Stage 0 -- Plugin Framework
-**Status: scaffolded, tests written, not yet run against installed deps**
+**Status: verified green** -- installed and run 2026-08-19 on Python 3.14.0
+(macOS/arm64): `pytest -m plugin_framework` 5 passed, `lookup-cli plugins
+list` shows both `echo` and `echo_standalone`. Reproduce with
+`./scripts/bootstrap.sh`.
 
 | Task | Depends on | Notes |
 |---|---|---|
@@ -23,8 +26,10 @@ Legend: **[ ]** not started **[~]** in progress **[x]** done
 | [x] Built-in `echo` plugin proving discovery works | registry | `src/lookup_cli/plugins/echo_builtin.py` |
 | [x] Standalone installable `echo_plugin` template package | registry | `plugins/echo_plugin/` -- copy this for every real connector |
 | [x] `lookup-cli plugins list` command | registry, CLI skeleton | `src/lookup_cli/cli.py` |
-| [ ] **Run `pytest -m plugin_framework` in a real environment and confirm green** | all above | first team member to pick this up: `pip install -e ".[dev]"` then `pip install -e plugins/echo_plugin` |
-| [ ] Set up CI (GitHub Actions) running `pytest` on every PR | above | template workflow not yet added -- open task |
+| [x] **Run `pytest -m plugin_framework` in a real environment and confirm green** | all above | 5 passed on Python 3.14.0, 2026-08-19 |
+| [x] Scripted one-command bootstrap so this is reproducible for every dev | above | `scripts/bootstrap.sh` -- installs core + all `plugins/*` packages, verifies CLI/discovery/tests, exits non-zero on failure. Referenced as the first step in `README.md` |
+| [~] Set up CI (GitHub Actions) running `pytest` on every PR | above | `.github/workflows/tests.yml` exists and matches the verified local commands; still needs one real PR run to confirm green in CI. Flip to [x] after that |
+| [ ] Fix `testpaths` so per-plugin test suites are collected | above | `pyproject.toml` sets `testpaths = ["tests"]`, so the 2 tests in `plugins/echo_plugin/tests/` are collected by neither a bare `pytest` nor CI (root run collects 13, not 15). They pass when run explicitly. Every real connector inherits this blind spot, so fix before Stage 2. Either add `plugins` to `testpaths` or add a per-plugin pytest step to CI -- touches core config, so decide deliberately |
 
 **Stage 0 is done when:** a developer can install the package, run
 `pytest -m plugin_framework`, see it pass, run `lookup-cli plugins list`,
@@ -33,14 +38,17 @@ and see `echo` in the output.
 ---
 
 ## Stage 1 -- Cache & Data Model
-**Status: scaffolded, tests written, not yet run**
+**Status: verified green** -- `pytest -m cache` 8 passed, 2026-08-19.
+`cache.py` at 100% line coverage, `models.py` at 95%. `config.py` is at 0% --
+no test exercises `Settings` yet (see task below).
 
 | Task | Depends on | Notes |
 |---|---|---|
 | [x] `Cache` class (SQLite, per plugin+identifier, TTL) | -- | `src/lookup_cli/cache.py` |
 | [x] `UnifiedUserRecord` merge/error model | -- | `src/lookup_cli/models.py` |
 | [x] `Settings` config loader (env vars / `.env`) | -- | `src/lookup_cli/config.py` |
-| [ ] **Run `pytest -m cache` and confirm green** | Cache, model | |
+| [x] **Run `pytest -m cache` and confirm green** | Cache, model | 8 passed on Python 3.14.0, 2026-08-19 |
+| [ ] Write tests for `Settings` config loader | Settings | `src/lookup_cli/config.py` is at 0% coverage -- nothing loads it yet. Cover env-var precedence, `.env` fallback, and missing-required-var behavior before Stage 2 depends on it for Okta creds |
 | [ ] Decide & document per-plugin default TTLs (Okta status probably shorter than, say, ABM device assignment) | none yet -- open decision | add to `docs/ARCHITECTURE.md` once decided |
 
 **Stage 1 is done when:** `pytest -m cache` passes, and cache/model
@@ -162,3 +170,12 @@ the relevant stage can finish, so it doesn't get lost in a task list:
 - [ ] Whether CLI subcommands for each plugin live in that plugin's own
       package or stay centralized in `src/lookup_cli/cli.py` (currently
       centralized; revisit if plugin count grows)
+- [ ] Supported Python versions (Stage 0). `requires-python = ">=3.11"`, CI
+      pins 3.11, but local dev is happening on 3.14 -- so CI is not testing
+      what developers run. Decide whether to add a version matrix to
+      `.github/workflows/tests.yml` or standardize on one local version.
+      All deps (pydantic 2.13, typer 0.27, httpx 0.28, respx, freezegun)
+      install and pass cleanly on 3.14 today.
+- [ ] Whether `plugins/*/tests` should be collected by the root `pytest` run
+      (Stage 0). Tracked as a task above; noting here because it changes core
+      `pyproject.toml` config and affects every future connector package.

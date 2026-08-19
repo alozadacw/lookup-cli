@@ -3,11 +3,13 @@
 ## Dev setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pip install -e plugins/echo_plugin
-cp .env.example .env
+./scripts/bootstrap.sh && source .venv/bin/activate
 ```
+
+Creates `.venv`, installs core + every `plugins/*` package, seeds `.env`, and
+verifies the CLI and test suite actually work. Re-runnable; exits non-zero if
+any check fails. `README.md` is the single source of truth for setup details
+and flags -- don't duplicate the install steps here, so they can't drift.
 
 ## TDD workflow (required)
 
