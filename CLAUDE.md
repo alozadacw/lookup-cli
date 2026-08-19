@@ -3,6 +3,61 @@
 Context for Claude Code / Claude Cowork working in this repo. Read this
 before making changes.
 
+## First session in this repo — do this before anything else
+
+This repo was scaffolded (Stage 0 + Stage 1) in a sandboxed environment
+with no network access, so the code was verified with `py_compile`
+only — it has **never actually been run against installed
+dependencies**. That's the very first thing to fix. Do these in order
+and don't skip ahead to feature work until step 4 is green:
+
+1. **Create/activate a virtualenv, then install everything:**
+   ```bash
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -e ".[dev]"
+   pip install -e plugins/echo_plugin
+   ```
+2. **Sanity-check the CLI loads:**
+   ```bash
+   lookup-cli plugins list
+   ```
+   Expect a table with one row: `echo`. If this fails, the plugin
+   framework itself is broken — fix that before anything else, and
+   don't touch `docs/STAGES.md` checkboxes until it's confirmed.
+3. **Run the two stages that claim to be done and confirm they
+   actually are:**
+   ```bash
+   pytest -m plugin_framework -v
+   pytest -m cache -v
+   pytest --cov=src/lookup_cli --cov-report=term-missing
+   ```
+   If anything fails, that's real signal the scaffold has a bug the
+   no-network sandbox couldn't catch — fix it, and only then flip
+   `docs/STAGES.md`'s "not yet run against installed deps" language to
+   confirmed-green.
+4. **Copy `.env.example` to `.env`** and fill in real `OKTA_ORG_URL` /
+   `OKTA_API_TOKEN` and `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`
+   (both services already have credentials per `docs/STAGES.md`).
+   Leave the Jamf/ABM/allwhere `LOOKUP_CLI_MOCK_*=1` flags as-is — no
+   credentials for those yet.
+5. **Resolve or triage the Open Decisions Log** at the bottom of
+   `docs/STAGES.md` before starting Stage 2-3 implementation work —
+   at minimum, flag which ones block starting vs. which can wait:
+   - Per-plugin cache TTLs
+   - Jira: `reporter` vs. `assignee` for "tickets submitted"
+   - ABM auth path (Apple direct API vs. MDM vendor proxy) — doesn't
+     block Stage 5's mock-first work, but blocks the real-API follow-up
+   - Whether per-plugin CLI subcommands stay centralized in `cli.py`
+     or move into each plugin package
+6. **Only after 1-5 are done**, pick up the next unchecked task in
+   `docs/STAGES.md` (Stage 2, Okta, is next — real credentials are
+   already available for it) and follow the TDD loop in "When picking
+   up a task" below.
+
+If any of steps 1-3 fail, stop and report the failure rather than
+patching around it silently — the whole point of this checklist is to
+catch anything the offline scaffolding pass couldn't verify.
+
 ## What this project is
 
 A Python CLI (`lookup-cli`) that looks up a person by name/username and
