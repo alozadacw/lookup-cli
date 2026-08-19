@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lookup-cli-echo-plugin"
+version = "0.1.0"
+description = "Template connector plugin for lookup-cli. Copy this package to build a new service connector (Jamf, ABM, allwhere, or anything else)."
+requires-python = ">=3.11"
+dependencies = ["lookup-cli"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2"]
+
+# This is the whole trick: register your plugin class here, under the
+# SAME entry-point group the core CLI already scans. Nothing in
+# src/lookup_cli/ needs to change when you add a new package like this.
+[project.entry-points."lookup_cli.plugins"]
+echo_standalone = "echo_plugin.plugin:EchoStandalonePlugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["echo_plugin*"]

@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core + dev deps
+        run: pip install -e ".[dev]"
+      - name: Install template plugin
+        run: pip install -e plugins/echo_plugin
+      # As real connector plugins are added under plugins/<name>_plugin,
+      # add one `pip install -e plugins/<name>_plugin` line each here.
+      - name: Run test suite
+        run: pytest --cov=src/lookup_cli --cov-report=term-missing
