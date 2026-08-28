@@ -12,7 +12,7 @@ from lookup_cli.plugins.base import ConnectorPlugin, ConnectorResult
 class EchoPlugin(ConnectorPlugin):
     name = "echo"
 
-    def fetch(self, identifier: str) -> ConnectorResult:
+    async def fetch(self, identifier: str) -> ConnectorResult:
         return ConnectorResult(
             plugin_name=self.name,
             identifier=identifier,

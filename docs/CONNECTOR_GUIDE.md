@@ -21,6 +21,23 @@ that's the contract the registry scans for.
 
 ## 3. Write tests first
 
+Start the file with that stage's marker, so `pytest -m <service>` covers the
+plugin package and not just core:
+
+```python
+pytestmark = pytest.mark.<service>
+```
+
+(`testpaths` includes `plugins`, so these run in the default suite and in CI
+automatically. `--strict-markers` is on: register the marker in the root
+`pyproject.toml` first or collection fails.)
+
+**Do not put an `__init__.py` in your plugin's `tests/` directory.** Two
+plugins whose test dirs are both packages named `tests` resolve to the same
+module name, and one silently shadows the other — the suite stays green
+while a connector's tests quietly stop running. `test_plugin_test_layout.py`
+in core fails the build if one reappears.
+
 In `plugins/<service>_plugin/tests/test_plugin.py`, write cases for:
 
 - a normal successful lookup (assert on `.data` shape)
@@ -35,6 +52,12 @@ Mock the HTTP layer -- don't hit the real API in unit tests. Use
 
 ## 4. Implement `fetch()`
 
+**`fetch()` is `async def`.** Stage 7 aggregates every plugin concurrently
+with `asyncio.gather`, so a serial lookup would cost the sum of every
+service's round trip. Use `httpx.AsyncClient`, and `await` your backend
+call. Tests are plain `async def test_...` -- pytest runs them
+automatically (`asyncio_mode = "auto"`).
+
 Keep the actual HTTP/SDK call in its own method (see `_call_backend` in
 the template) so:
 - tests can monkeypatch just that method when a full HTTP mock isn't
@@ -46,21 +69,66 @@ the template) so:
 and return `ConnectorResult(error=...)` instead. Let unexpected bugs
 propagate (don't swallow everything with a bare `except: pass`).
 
-## 5. Support mock mode if credentials aren't ready yet
+**Scrub the error string. Never `str(exc)` directly:**
 
 ```python
-import os
+from lookup_cli.redaction import safe_error
 
+async def fetch(self, identifier: str) -> ConnectorResult:
+    try:
+        data = await self._call_backend(identifier)
+    except Exception as exc:
+        return ConnectorResult(plugin_name=self.name, identifier=identifier,
+                               error=safe_error(exc))
+    return ConnectorResult(plugin_name=self.name, identifier=identifier, data=data)
+```
+
+That string is not ephemeral -- `Cache.put()` writes it into the SQLite
+cache and the CLI prints it. An httpx exception routinely carries the
+request URL, and a mishandled one can carry an auth header, so a plain
+`str(exc)` turns a transient 401 into a durable plaintext credential on
+disk. `safe_error()` strips `Bearer`/`SSWS`/`Basic` credentials, URL
+userinfo, secret query parameters, JWTs, and the literal values of
+secret-named environment variables.
+
+If your client holds a credential that isn't exposed as an obviously-named
+env var, pass it explicitly: `safe_error(exc, secrets=[self._token])`.
+
+## 5. Declare credentials and support mock mode
+
+Never call `os.getenv` in a plugin. Core builds one `PluginConfig` -- merging
+`.env` and the process environment, with the environment winning -- and
+injects it as `self.config`. Reading `.env` centrally matters: `bootstrap.sh`
+writes credentials there and nothing exports them, so a plugin reading only
+`os.environ` would see nothing after a developer followed the README.
+
+Declare what you need in `required_credentials`, and core reports an
+unconfigured plugin up front (`lookup-cli plugins list` shows a status
+column) instead of letting it fail mid-lookup.
+
+`mock_mode` is built in and follows the `LOOKUP_CLI_MOCK_<PLUGIN>`
+convention already in `.env.example` -- no per-plugin flag plumbing, and a
+mock-mode plugin counts as configured even with no credentials.
+
+```python
 class JamfPlugin(ConnectorPlugin):
     name = "jamf"
+    required_credentials = ("JAMF_BASE_URL", "JAMF_CLIENT_ID", "JAMF_CLIENT_SECRET")
 
-    def __init__(self):
-        self._mock = os.getenv("LOOKUP_CLI_MOCK_JAMF") == "1"
-
-    def _call_backend(self, identifier: str) -> dict:
-        if self._mock:
+    async def _call_backend(self, identifier: str) -> dict:
+        if self.mock_mode:                      # LOOKUP_CLI_MOCK_JAMF=1
             return self._mock_fixture(identifier)
-        return self._real_api_call(identifier)
+        base_url = self.config.require("JAMF_BASE_URL")   # raises MissingCredential
+        ...
+```
+
+If you override `__init__`, you must call `super().__init__(config)` -- the
+registry raises a `PluginLoadError` telling you so if you forget.
+
+In tests, inject instead of monkeypatching the environment:
+
+```python
+plugin = JamfPlugin(PluginConfig({"JAMF_BASE_URL": "https://jamf.test", ...}))
 ```
 
 Keep fixtures in `plugins/<service>_plugin/<service>_plugin/fixtures/`

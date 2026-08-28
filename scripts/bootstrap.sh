@@ -131,6 +131,14 @@ else
     warn "no .env.example found; skipping"
 fi
 
+# .env holds live API tokens. `cp` inherits the umask (commonly 022, i.e.
+# world-readable), so tighten it explicitly -- including on a pre-existing
+# file, which may predate this check.
+if [[ -f .env ]]; then
+    chmod 600 .env
+    ok ".env permissions set to 600 (owner read/write only)"
+fi
+
 # --- 5. Verify ---------------------------------------------------------------
 failures=()
 run_check() {
@@ -168,17 +176,11 @@ else
         "${VENV_DIR}/bin/pytest" -m plugin_framework
     run_check "pytest -m cache (Stage 1)" \
         "${VENV_DIR}/bin/pytest" -m cache
+    # pyproject's testpaths now covers both tests/ and plugins/, so this
+    # single run includes every connector package's own tests. (It used to
+    # need a separate per-plugin loop here; see docs/STAGES.md Stage 0.)
     run_check "full suite + coverage" \
         "${VENV_DIR}/bin/pytest" --cov=src/lookup_cli --cov-report=term-missing
-
-    # pyproject's testpaths is scoped to tests/, so each plugin package's own
-    # tests are NOT collected by the run above. Run them explicitly so a
-    # broken connector package can't pass bootstrap unnoticed.
-    # See docs/STAGES.md Stage 0 for the open task to fix testpaths + CI.
-    for plugin_tests in plugins/*/tests; do
-        [[ -d "$plugin_tests" ]] || continue
-        run_check "pytest ${plugin_tests}" "${VENV_DIR}/bin/pytest" "$plugin_tests"
-    done
 fi
 
 # --- 6. Summary -------------------------------------------------------------
