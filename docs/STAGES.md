@@ -24,12 +24,37 @@ They cannot coexist with `okta jdoe`: a person whose login is literally
 being looked up — a wrong answer rather than an error.
 
 - Bare `<service> <identifier>` shows that service's primary view.
-- Flags are additive selectors and bundle (`-sd`).
+- Flags are additive selectors and bundle (`-sd`, `-sdau`).
 - Flags may precede or follow the identifier. This needs
   `context_settings={"allow_interspersed_args": True}` on the plugin's
   `typer.Typer`, because Click groups otherwise stop parsing options at the
   first positional and `<service> jdoe -d` fails while `<service> -d jdoe`
   works.
+
+### Flag spelling (decided 2026-09-02)
+
+Each section declares **three** spellings: a single character, a
+multi-character single-dash form, and a long form — e.g. apps is
+`-a` / `-apps` / `--apps`, authenticators is
+`-u` / `-authenticators` / `--authenticators`.
+
+The single-character form is what makes bundling work; the longer forms are
+what make a script readable. Both are wanted, so both are declared.
+
+Two consequences to know before adding a stage's flags:
+
+- **A multi-character single-dash flag cannot appear inside a bundle.**
+  `-sdapp` is a usage error, not a bug. When Click can't match a single-dash
+  string as a whole it decomposes it character by character, so `-sdapp` reads
+  as `-s -d -a -p -p` and there is no `-p`. The bundled spelling is `-sdau`;
+  the readable spelling is `-sd -apps`. Failing loudly is the correct outcome
+  and there is a test pinning it.
+- **Never declare a multi-char form that is also a valid bundle of declared
+  single chars.** With `-a` and `-u` both declared, `-au` already means
+  apps+authenticators. Declaring `-au` as an authenticators alias would make
+  `-au` mean authenticators-only while `-sdau` still meant apps+authenticators
+  — the same two letters meaning two different things depending on position.
+  This is why `-au` and `-app` are deliberately *not* declared.
 
 Okta (Stage 2) is the reference implementation. Stage 7's aggregate command
 `lookup-cli lookup <identifier>` takes the same shape.
@@ -86,9 +111,9 @@ behavior is exercised by at least one real plugin in Stage 2.
 ---
 
 ## Stage 2 -- Okta Connector (real API, credentials available)
-**Status: mocks green** -- `pytest -m okta` 23 passed, 2026-08-25. The
+**Status: mocks green** -- `pytest -m okta` 208 passed, 2026-09-02. The
 manual smoke test against the real org is still outstanding (blocked on a
-real token in `.env`).
+real token in `.env`) and is now the **only** unchecked task in this stage.
 
 | Task | Depends on |
 |---|---|
@@ -103,6 +128,8 @@ real token in `.env`).
 | [x] `-s/--status` — account status, flagging deactivated explicitly | plugin implemented |
 | [x] Surface the `access_blocked` custom profile attribute under status | plugin implemented |
 | [x] `--last-signin` — per-device last sign-in, opt-in, with `--since` | devices |
+| [x] `-a`/`-apps`/`--apps` — applications assigned to a user (`/appLinks`) | plugin implemented |
+| [x] `-u`/`-authenticators`/`--authenticators` — enrolled authenticators (`/factors`) | plugin implemented |
 
 Notes from the implementation:
 
@@ -124,10 +151,13 @@ Notes from the implementation:
   lookup and must not pay for a second round trip nobody asked for. `-sd`
   reuses the id it already resolved, so it costs two calls, not three. Link-header
   pagination is followed, bounded at 20 pages so a looping `next` can't hang.
-- **Exit codes depend on what was asked for.** With `-d` alone the devices are
-  the whole answer, so a device-API failure exits 1 and scripts can trust it.
-  With `-sd` the status is already a real answer on screen, so the same failure
-  degrades just that section and exits 0.
+- **Exit codes depend on what was asked for.** A section that is the *whole*
+  answer fails the command: with `-d` alone a device-API failure exits 1, and
+  scripts can trust it. Once more than one section is on screen the same
+  failure degrades just that section and exits 0, because the others are real
+  answers already printed. Generalised to all four sections on 2026-09-02
+  (`sole_section` in `cli()`), so `-au` with a dead factors endpoint still
+  prints the app list.
 - **`access blocked` comes from the profile, not the status enum.** This org's
   Universal Directory defines a custom attribute (Profile Editor label
   "ACCESS BLOCKED", variable name `access_blocked`) that arrives inside the
@@ -170,9 +200,43 @@ Notes from the implementation:
   - **Unverified against a real org.** Whether events populate `device.id`
     depends on Identity Engine and Okta Verify enrolment. If they do not, the
     column is honestly empty — worth confirming in the live smoke test.
-- **Flag convention:** short flags are section selectors (`-s`, `-d`); long-only
-  flags modify how a section renders (`--last-signin`, `--since`). Keeps `-sd`
-  meaning "two sections" and leaves `-l`/`-g`/`-a` free for future sections.
+- **Flag convention:** short flags are section selectors (`-s`, `-d`, `-a`,
+  `-u`); long-only flags modify how a section renders (`--last-signin`,
+  `--since`). Keeps `-sdau` meaning "four sections" and leaves `-g`/`-l` free
+  for future ones. Spelling rules are in the CLI shape note at the top of this
+  file — read them before adding a flag to another stage.
+- **`-a` lists applications** via `GET /api/v1/users/{userId}/appLinks`, the
+  same list that builds the user's Okta dashboard.
+  - **It answers "what can they open", not "how were they granted it".**
+    Direct-vs-group assignment lives on `/apps/{appId}/users/{userId}` and
+    costs one request per app, so it is not fetched. Worth adding later behind
+    its own opt-in flag if offboarding needs to know which group to remove
+    someone from.
+  - **Hidden tiles are listed, not filtered.** A hidden app is still a live
+    assignment; skipping it would under-report access, which is the worst
+    failure mode this tool has. The column is named `hidden` after the API
+    field rather than inverted to `visible`, so nobody has to flip the sense
+    of it in their head.
+  - Sorted alphabetically, because Okta returns per-user dashboard sort order
+    and two people's app lists are otherwise not comparable.
+- **`-u` lists authenticators** via `GET /api/v1/users/{userId}/factors`. The
+  API says "factor", the admin console says "authenticator"; the CLI follows
+  the console and the API's word is kept for anything touching the wire.
+  - **`profile.questionText` is deliberately dropped.** That a security
+    question is enrolled is the useful fact; printing the question itself
+    hands over a recovery-credential hint for no operational gain. There is a
+    test asserting it never reaches the terminal.
+  - **Inactive and half-finished enrolments are included.** A disabled
+    authenticator is still enrolled, and `PENDING_ACTIVATION` is a real state
+    — someone started an enrolment and never finished. Status is shown
+    verbatim.
+  - **A non-Okta provider is named in the label** (`Okta Verify push (DUO)`).
+    A Duo push and an Okta Verify push are different systems to go and revoke.
+    Unknown `factorType` values fall through to the raw wire value rather than
+    getting an invented label.
+- **All three list endpoints share one paging helper** (`_fetch_all_pages`),
+  so devices, apps and authenticators cannot quietly drift apart on Link-header
+  handling, the 20-page bound, or the self-referential-`next` guard.
 - **`-s` translates the enum.** Okta has eight statuses; "deactivated" in the
   admin UI means `DEPROVISIONED` specifically, and `SUSPENDED` is a different
   state that also blocks login. The CLI prints a verdict line
@@ -340,6 +404,32 @@ the relevant stage can finish, so it doesn't get lost in a task list:
       run (Stage 0)~~ **Resolved 2026-08-25:** yes, via
       `testpaths = ["tests", "plugins"]` + `--import-mode=importlib`. See the
       Stage 0 task row for why the import mode is mandatory.
+- [x] ~~How to spell multi-section short flags so they still bundle
+      (Stage 2)~~ **Resolved 2026-09-02:** declare three spellings per
+      section — `-a` / `-apps` / `--apps`. Verified against the real Click
+      parser before writing tests, not assumed. `-sdapp` cannot be made to
+      work in any declaration scheme, because Click decomposes an unmatched
+      single-dash string character by character; `-sdau` is the bundled
+      equivalent. The spike also killed the obvious-looking option of
+      declaring `-au` as an authenticators alias: it would have made `-au`
+      mean authenticators-only while `-sdau` still meant apps+authenticators,
+      the same letters meaning different things by position. Full rules in the
+      CLI shape note at the top of this file.
+- [ ] **Should apps and authenticators become one combined "access" view?**
+      Both answer "what can this person still get into", and an offboarding
+      operator likely wants them together. Left as two flags for now because
+      they are independent API calls with independent failure modes, and
+      `-au` already composes them. Revisit once Stage 7 aggregation exists.
+- [ ] **Direct-vs-group app assignment is not fetched.** `-a` says a user has
+      an app, not which group granted it — that needs one
+      `/apps/{appId}/users/{userId}` call per app. If offboarding needs to
+      know *which group to remove someone from*, add it behind its own opt-in
+      flag (same reasoning as `--last-signin`), never automatically.
+- [ ] **Authenticators and devices are not joined.** An Okta Verify push
+      factor and an Okta device registry entry can refer to the same phone,
+      but the factor `profile.name` and the device `displayName` are only
+      correlatable by string match, which would be a guess. Left unjoined
+      deliberately; revisit only if a reliable id links them.
 - [ ] Which stage marker cross-cutting core utilities belong to.
       `test_redaction.py` was filed under `plugin_framework` because error
       handling is part of the plugin contract in `base.py`, but it is not
