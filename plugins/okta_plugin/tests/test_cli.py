@@ -15,6 +15,8 @@ Run just this stage:  pytest -m okta
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 import respx
@@ -34,9 +36,24 @@ DEVICES_URL = f"{USERS_URL}/{USER_ID}/devices"
 CONFIG = PluginConfig({"OKTA_ORG_URL": ORG_URL, "OKTA_API_TOKEN": "not-a-real-token"})
 MOCK_CONFIG = PluginConfig({"LOOKUP_CLI_MOCK_OKTA": "1"})
 
-# Pin the terminal width: rich sizes tables to the terminal, so assertions on
-# cell contents would otherwise depend on whoever's shell runs the suite.
-runner = CliRunner(env={"COLUMNS": "200"})
+# Pin the terminal width and disable colour: rich sizes tables to the terminal,
+# so assertions on cell contents would otherwise depend on whoever's shell runs
+# the suite.
+runner = CliRunner(env={"COLUMNS": "200", "NO_COLOR": "1", "TERM": "dumb"})
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _out(result) -> str:
+    """CLI output with ANSI styling stripped.
+
+    Belt and braces alongside NO_COLOR. CI rendered rich output in colour
+    while local runs did not, and rich splits a styled token like `--status`
+    across escape sequences -- so `"--status" in result.stdout` passed
+    locally and failed in CI for a CLI that was working correctly. Assert on
+    text, never on styling.
+    """
+    return _ANSI.sub("", result.stdout)
 
 
 def _app(config: PluginConfig = CONFIG):
@@ -87,7 +104,7 @@ def test_identifier_alone_shows_status():
     result = runner.invoke(_app(), ["okta", "jdoe"])
 
     assert result.exit_code == 0
-    assert "ACTIVE" in result.stdout
+    assert "ACTIVE" in _out(result)
 
 
 @respx.mock
@@ -124,7 +141,7 @@ def test_explicit_status_flag_matches_the_default():
     _mock_user()
     result = runner.invoke(_app(), ["okta", "jdoe", "-s"])
     assert result.exit_code == 0
-    assert "ACTIVE" in result.stdout
+    assert "ACTIVE" in _out(result)
 
 
 @respx.mock
@@ -142,8 +159,8 @@ def test_deactivated_user_is_called_out_in_plain_language():
     result = runner.invoke(_app(), ["okta", "jdoe", "-s"])
 
     assert result.exit_code == 0
-    assert "DEPROVISIONED" in result.stdout
-    assert "deactivated" in result.stdout.lower()
+    assert "DEPROVISIONED" in _out(result)
+    assert "deactivated" in _out(result).lower()
 
 
 @respx.mock
@@ -154,15 +171,15 @@ def test_suspended_is_distinguished_from_deactivated():
 
     result = runner.invoke(_app(), ["okta", "jdoe", "-s"])
 
-    assert "SUSPENDED" in result.stdout
-    assert "deactivated" not in result.stdout.lower()
+    assert "SUSPENDED" in _out(result)
+    assert "deactivated" not in _out(result).lower()
 
 
 @respx.mock
 def test_active_user_is_not_labelled_deactivated():
     _mock_user("ACTIVE")
     result = runner.invoke(_app(), ["okta", "jdoe"])
-    assert "deactivated" not in result.stdout.lower()
+    assert "deactivated" not in _out(result).lower()
 
 
 @pytest.mark.parametrize("status", ["LOCKED_OUT", "PASSWORD_EXPIRED", "STAGED", "PROVISIONED"])
@@ -170,7 +187,7 @@ def test_active_user_is_not_labelled_deactivated():
 def test_other_statuses_are_reported_verbatim(status):
     _mock_user(status)
     result = runner.invoke(_app(), ["okta", "jdoe"])
-    assert status in result.stdout
+    assert status in _out(result)
 
 
 # --- -d / --devices ----------------------------------------------------------------
@@ -184,7 +201,7 @@ def test_devices_flag_shows_devices():
     result = runner.invoke(_app(), ["okta", "jdoe", "-d"])
 
     assert result.exit_code == 0
-    assert "C02XYZ123ABC" in result.stdout
+    assert "C02XYZ123ABC" in _out(result)
 
 
 @respx.mock
@@ -195,7 +212,7 @@ def test_long_devices_flag_works():
     result = runner.invoke(_app(), ["okta", "jdoe", "--devices"])
 
     assert result.exit_code == 0
-    assert "C02XYZ123ABC" in result.stdout
+    assert "C02XYZ123ABC" in _out(result)
 
 
 @respx.mock
@@ -206,7 +223,7 @@ def test_devices_flag_alone_omits_the_status_table():
 
     result = runner.invoke(_app(), ["okta", "jdoe", "-d"])
 
-    assert "last_login" not in result.stdout
+    assert "last_login" not in _out(result)
 
 
 @respx.mock
@@ -217,7 +234,7 @@ def test_no_devices_message():
     result = runner.invoke(_app(), ["okta", "jdoe", "-d"])
 
     assert result.exit_code == 0
-    assert "No devices" in result.stdout
+    assert "No devices" in _out(result)
 
 
 # --- Combining flags -----------------------------------------------------------------
@@ -230,8 +247,8 @@ def test_both_flags_show_both_sections():
 
     result = runner.invoke(_app(), ["okta", "jdoe", "-s", "-d"])
 
-    assert "last_login" in result.stdout
-    assert "C02XYZ123ABC" in result.stdout
+    assert "last_login" in _out(result)
+    assert "C02XYZ123ABC" in _out(result)
 
 
 @respx.mock
@@ -241,8 +258,8 @@ def test_bundled_short_flags_work():
 
     result = runner.invoke(_app(), ["okta", "jdoe", "-sd"])
 
-    assert "last_login" in result.stdout
-    assert "C02XYZ123ABC" in result.stdout
+    assert "last_login" in _out(result)
+    assert "C02XYZ123ABC" in _out(result)
 
 
 @respx.mock
@@ -253,7 +270,7 @@ def test_flags_may_precede_the_identifier():
     result = runner.invoke(_app(), ["okta", "-d", "jdoe"])
 
     assert result.exit_code == 0
-    assert "C02XYZ123ABC" in result.stdout
+    assert "C02XYZ123ABC" in _out(result)
 
 
 @respx.mock
@@ -277,7 +294,7 @@ def test_unknown_user_exits_zero_and_makes_no_device_call():
     result = runner.invoke(_app(), ["okta", "ghost", "-d"])
 
     assert result.exit_code == 0
-    assert "No Okta account" in result.stdout
+    assert "No Okta account" in _out(result)
     assert not devices_route.called
 
 
@@ -299,8 +316,8 @@ def test_a_devices_failure_alongside_status_still_shows_the_status():
 
     result = runner.invoke(_app(), ["okta", "jdoe", "-sd"])
 
-    assert "ACTIVE" in result.stdout
-    assert "unavailable" in result.stdout.lower()
+    assert "ACTIVE" in _out(result)
+    assert "unavailable" in _out(result).lower()
 
 
 @respx.mock
@@ -319,7 +336,7 @@ def test_missing_credentials_exit_non_zero_with_an_actionable_message():
     result = runner.invoke(build_app({"okta": OktaPlugin(PluginConfig({}))}), ["okta", "x"])
 
     assert result.exit_code == 1
-    assert "OKTA_ORG_URL" in result.stdout
+    assert "OKTA_ORG_URL" in _out(result)
 
 
 # --- Help and mock mode ---------------------------------------------------------------------
@@ -329,12 +346,12 @@ def test_help_documents_both_flags():
     result = runner.invoke(_app(), ["okta", "--help"])
 
     for expected in ("-s", "--status", "-d", "--devices"):
-        assert expected in result.stdout
+        assert expected in _out(result)
 
 
 def test_help_shows_the_identifier_as_a_direct_argument():
     result = runner.invoke(_app(), ["okta", "--help"])
-    assert "identifier" in result.stdout
+    assert "identifier" in _out(result)
 
 
 def test_removed_subcommands_are_gone():
@@ -343,12 +360,12 @@ def test_removed_subcommands_are_gone():
     result = runner.invoke(_app(MOCK_CONFIG), ["okta", "status"])
 
     assert result.exit_code == 0
-    assert "status" in result.stdout  # treated as a username
+    assert "status" in _out(result)  # treated as a username
 
 
 def test_mock_mode_end_to_end():
     result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "-sd"])
 
     assert result.exit_code == 0
-    assert "ACTIVE" in result.stdout
-    assert "C02MOCK00001" in result.stdout
+    assert "ACTIVE" in _out(result)
+    assert "C02MOCK00001" in _out(result)
