@@ -102,6 +102,7 @@ real token in `.env`).
 | [x] `-d/--devices` — devices registered to a user | plugin implemented |
 | [x] `-s/--status` — account status, flagging deactivated explicitly | plugin implemented |
 | [x] Surface the `access_blocked` custom profile attribute under status | plugin implemented |
+| [x] `--last-signin` — per-device last sign-in, opt-in, with `--since` | devices |
 
 Notes from the implementation:
 
@@ -145,6 +146,33 @@ Notes from the implementation:
     synced from Workday/AD it can lag the real account state, and a
     disagreement between the two is exactly what an offboarding check wants to
     surface.
+- **`--last-signin` is a two-source join, and opt-in.** `/users/{id}/devices`
+  has no last-login field. Its `lastUpdated` is the trap: it moves when the
+  device *record* changes (profile sync, management flip, OS bump), not when
+  anyone signed in — wiring it up would have produced plausible, wrong answers,
+  which in an offboarding tool is worse than showing nothing. Sign-in times come
+  from `/api/v1/logs` instead, correlated on `device.id`.
+  - **Opt-in, not automatic**, because `/api/v1/logs` is Okta's most
+    rate-limited endpoint. A plain `-d` never touches it (there is a test).
+  - **One query for all devices, not one per device.** Results come back
+    `DESCENDING`, so the first sighting of a device is its most recent sign-in
+    and paging stops as soon as every known device is accounted for.
+  - **90-day wall.** Okta retains System Log data ~90 days, so `--since` is
+    clamped to that. The window is printed in the column header rather than
+    hidden in `--help`: a blank cell means "not in this window", never "never
+    used", and for an offboarding review those are opposite conclusions.
+  - **Unattributable events are dropped, not guessed.** Not every auth event
+    stamps `device.id`. The tempting fallback — matching on `client.userAgent` —
+    cannot tell two MacBooks apart and would assign one device's sign-in to
+    another. An honest blank beats confident-wrong.
+  - A log failure degrades the column to `?` and keeps the inventory; the
+    devices list is a real answer on its own.
+  - **Unverified against a real org.** Whether events populate `device.id`
+    depends on Identity Engine and Okta Verify enrolment. If they do not, the
+    column is honestly empty — worth confirming in the live smoke test.
+- **Flag convention:** short flags are section selectors (`-s`, `-d`); long-only
+  flags modify how a section renders (`--last-signin`, `--since`). Keeps `-sd`
+  meaning "two sections" and leaves `-l`/`-g`/`-a` free for future sections.
 - **`-s` translates the enum.** Okta has eight statuses; "deactivated" in the
   admin UI means `DEPROVISIONED` specifically, and `SUSPENDED` is a different
   state that also blocks login. The CLI prints a verdict line

@@ -486,3 +486,176 @@ def test_devices_only_view_does_not_show_the_row():
     out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d"]))
 
     assert "access blocked" not in out
+
+
+# --- --last-signin ------------------------------------------------------------------
+#
+# Opt-in modifier on the devices view. Long-only by convention: short flags are
+# section selectors (-s, -d), long flags modify how a section renders. That
+# keeps -sd meaning "two sections" and leaves -l/-g/-a free for future sections.
+
+LOGS_URL = f"{ORG_URL}/api/v1/logs"
+MBP = "guoMACBOOK00000000001"
+
+
+def _device_with_id(device_id: str, serial: str, name: str) -> dict:
+    entry = _device_link(serial=serial, name=name)
+    entry["id"] = device_id
+    entry["device"]["id"] = device_id
+    return entry
+
+
+def _signin_event(device_id: str, published: str) -> dict:
+    return {
+        "published": published,
+        "eventType": "user.session.start",
+        "outcome": {"result": "SUCCESS"},
+        "device": {"id": device_id},
+    }
+
+
+def _mock_devices_and_logs(events: list[dict] | None = None, log_status: int = 200):
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+    respx.get(DEVICES_URL).mock(
+        return_value=httpx.Response(200, json=[_device_with_id(MBP, "C02XYZ123ABC", "Jane's MBP")])
+    )
+    respx.get(LOGS_URL).mock(return_value=httpx.Response(log_status, json=events or []))
+
+
+@respx.mock
+def test_devices_alone_has_no_signin_column():
+    _mock_devices_and_logs()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d"]))
+
+    assert "last sign-in" not in out
+
+
+@respx.mock
+def test_devices_alone_does_not_touch_the_rate_limited_log_endpoint():
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+    respx.get(DEVICES_URL).mock(
+        return_value=httpx.Response(200, json=[_device_with_id(MBP, "C02XYZ123ABC", "Jane's MBP")])
+    )
+    logs = respx.get(LOGS_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    runner.invoke(_app(), ["okta", "jdoe", "-d"])
+
+    assert not logs.called
+
+
+@respx.mock
+def test_last_signin_adds_the_column_with_a_date():
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "last sign-in" in out
+    assert "2026-08-28" in out
+
+
+@respx.mock
+def test_last_signin_implies_devices():
+    """Asking for per-device sign-ins obviously means you want the device table."""
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "--last-signin"])
+
+    assert result.exit_code == 0
+    assert "C02XYZ123ABC" in _out(result)
+
+
+@respx.mock
+def test_device_with_no_signin_in_the_window_shows_a_placeholder():
+    """Must not read as "never used" -- the window is all we can see."""
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "last sign-in" in out
+
+
+@respx.mock
+def test_column_header_states_the_window():
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "90d" in out
+
+
+@respx.mock
+def test_since_narrows_the_window_and_the_header_follows():
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin", "--since", "30d"]))
+
+    assert "30d" in out
+
+
+@respx.mock
+def test_invalid_since_is_rejected_with_a_clear_message():
+    _mock_devices_and_logs([])
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin", "--since", "banana"])
+
+    assert result.exit_code != 0
+    assert "since" in _out(result).lower()
+
+
+@respx.mock
+def test_a_log_failure_degrades_the_column_but_keeps_the_devices():
+    """The inventory is still a real answer; losing sign-in times shouldn't
+    discard it."""
+    _mock_devices_and_logs(log_status=403)
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    assert "C02XYZ123ABC" in out, "device inventory must survive"
+    assert "?" in out
+
+
+def test_help_documents_the_flag_and_since():
+    out = _out(runner.invoke(_app(), ["okta", "--help"]))
+
+    assert "--last-signin" in out
+    assert "--since" in out
+
+
+def test_last_signin_has_no_short_flag():
+    """Short flags are reserved for section selectors (-s, -d)."""
+    result = runner.invoke(_app(), ["okta", "jdoe", "-L"])
+
+    assert result.exit_code != 0
+
+
+def test_mock_mode_end_to_end_with_last_signin():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "-d", "--last-signin"])
+
+    assert result.exit_code == 0
+    assert "last sign-in" in _out(result)
+
+
+@respx.mock
+def test_model_gives_way_to_keep_the_table_readable_at_80_columns():
+    """Six columns re-create the squeeze that going seven-to-five fixed."""
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]).stdout)
+
+    assert "C02XYZ123ABC" in out, "serial must never be squeezed out"
+    assert "2026-08-28" in out
+    assert "model" not in out
+
+
+@respx.mock
+def test_model_is_still_shown_without_the_signin_column():
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_devices_and_logs()
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "jdoe", "-d"]).stdout)
+
+    assert "model" in out

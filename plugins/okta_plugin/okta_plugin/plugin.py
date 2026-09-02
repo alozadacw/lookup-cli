@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -72,6 +74,38 @@ DEFAULT_ACCESS_ATTRIBUTE = "access_blocked"
 
 #: Label for that value in CLI output.
 ACCESS_FIELD_LABEL = "access blocked"
+
+#: Okta retains System Log data for roughly 90 days. Asking for longer cannot
+#: return longer, and letting a caller believe otherwise would put a window in
+#: the column header that the data does not actually cover.
+MAX_LOG_WINDOW = timedelta(days=90)
+
+#: Sign-in events that can carry device identity.
+_SIGNIN_EVENT_TYPES = ("user.session.start", "user.authentication.sso")
+
+_SINCE_RE = re.compile(r"^\s*(\d+)\s*([dh])\s*$", re.IGNORECASE)
+
+
+def parse_since(raw: str) -> timedelta:
+    """Parse a `--since` window like `90d` or `12h`, clamped to retention."""
+    match = _SINCE_RE.match(raw or "")
+    if not match:
+        raise ValueError(
+            f"could not parse --since {raw!r}. Use a number followed by "
+            f"'d' (days) or 'h' (hours), e.g. 30d or 12h."
+        )
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise ValueError("--since must be greater than zero.")
+    window = timedelta(days=amount) if match.group(2).lower() == "d" else timedelta(hours=amount)
+    return min(window, MAX_LOG_WINDOW)
+
+
+def describe_window(window: timedelta) -> str:
+    """Short label for a window, for the column header."""
+    if window >= timedelta(days=1) and window.total_seconds() % 86400 == 0:
+        return f"{int(window.total_seconds() // 86400)}d"
+    return f"{int(window.total_seconds() // 3600)}h"
 
 #: Okta's status enum has eight values, and the raw name is not always what
 #: an operator needs to read. "Deactivated" in the Okta admin UI means
@@ -179,7 +213,105 @@ class OktaPlugin(ConnectorPlugin):
             tags=["no-devices"] if not devices else ["has-devices"],
         )
 
+    async def fetch_device_signins(
+        self,
+        okta_id: str,
+        *,
+        since: timedelta,
+        device_ids: set[str] | None = None,
+    ) -> ConnectorResult:
+        """Most recent successful sign-in per device, from the System Log.
+
+        `/users/{id}/devices` has no last-login field -- its `lastUpdated`
+        tracks changes to the device *record*, not sign-ins -- so this is a
+        separate source correlated on `device.id`.
+
+        Pass `device_ids` when the caller knows which devices it cares about:
+        results come back newest-first, so once every device has been seen the
+        remaining pages cannot change the answer and paging stops early. That
+        matters because /api/v1/logs is Okta's most rate-limited endpoint.
+        """
+        try:
+            signins = await self._call_logs_backend(okta_id, since, device_ids)
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=okta_id,
+                error=safe_error(exc, secrets=[self.config.get("OKTA_API_TOKEN")]),
+            )
+
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=okta_id,
+            data={"signins": signins, "window": describe_window(since)},
+        )
+
     # -- backend seam ---------------------------------------------------------
+
+    async def _call_logs_backend(
+        self, okta_id: str, since: timedelta, device_ids: set[str] | None
+    ) -> dict[str, str]:
+        if self.mock_mode:
+            return self._mock_signins_fixture()
+
+        org_url = self.config.require("OKTA_ORG_URL").rstrip("/")
+        event_filter = " or ".join(f'eventType eq "{e}"' for e in _SIGNIN_EVENT_TYPES)
+        params = {
+            "since": (datetime.now(timezone.utc) - since).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "filter": f'actor.id eq "{okta_id}" and ({event_filter})',
+            "sortOrder": "DESCENDING",
+            "limit": "1000",
+        }
+
+        url = f"{org_url}/api/v1/logs"
+        signins: dict[str, str] = {}
+        seen_urls: set[str] = set()
+        first = True
+
+        async with self._client() as client:
+            for _ in range(_MAX_PAGES):
+                if url in seen_urls:
+                    break
+                seen_urls.add(url)
+
+                response = await client.get(
+                    url, headers=self._headers(), params=params if first else None
+                )
+                first = False
+                if response.status_code in (401, 403):
+                    raise RuntimeError(
+                        "Okta refused the System Log request. This API token may lack "
+                        "System Log read access, which is granted separately from user "
+                        "read access."
+                    )
+                response.raise_for_status()
+
+                for event in response.json():
+                    if (event.get("outcome") or {}).get("result") != "SUCCESS":
+                        continue
+                    device_id = (event.get("device") or {}).get("id")
+                    if not device_id:
+                        # Not every auth event stamps a device. Guessing from
+                        # the user agent could not tell two MacBooks apart, so
+                        # an unattributable event is dropped rather than
+                        # assigned to the wrong machine.
+                        continue
+                    # DESCENDING: the first sighting is the most recent.
+                    signins.setdefault(device_id, event.get("published"))
+
+                if device_ids and device_ids.issubset(signins):
+                    break
+
+                next_url = response.links.get("next", {}).get("url")
+                if not next_url:
+                    break
+                url = next_url
+
+        return signins
+
+    def _mock_signins_fixture(self) -> dict[str, str]:
+        return {"guoMOCK00000000000001": "2026-01-01T09:15:00.000Z"}
+
 
     async def _call_devices_backend(self, okta_id: str) -> list[dict]:
         if self.mock_mode:
@@ -301,6 +433,7 @@ class OktaPlugin(ConnectorPlugin):
         device = entry.get("device") or entry
         profile = device.get("profile") or {}
         return {
+            "device_id": device.get("id") or entry.get("id"),
             "display_name": profile.get("displayName"),
             "platform": profile.get("platform"),
             "manufacturer": profile.get("manufacturer"),
@@ -390,8 +523,34 @@ class OktaPlugin(ConnectorPlugin):
                 help="List devices registered to this user in Okta "
                 "(Okta Verify / device trust -- not the Jamf or ABM inventory).",
             ),
+            last_signin: bool = typer.Option(
+                False,
+                "--last-signin",
+                help="Add each device's most recent sign-in, from the Okta System "
+                "Log. Opt-in: it costs an extra call to a rate-limited endpoint. "
+                "Implies --devices.",
+            ),
+            since: str = typer.Option(
+                "90d",
+                "--since",
+                help="Window for --last-signin, e.g. 30d or 12h. Okta retains "
+                "System Log data for about 90 days, which is the maximum.",
+            ),
         ) -> None:
             """Look one person up in Okta."""
+            # Asking for per-device sign-ins obviously means you want the
+            # device table; requiring -d as well would just be pedantry.
+            if last_signin:
+                devices = True
+
+            window = None
+            if last_signin:
+                try:
+                    window = parse_since(since)
+                except ValueError as exc:
+                    console.print(f"[red]Invalid --since:[/red] {exc}")
+                    raise typer.Exit(code=2)
+
             # Flags select sections. With none given, status is what people
             # want; `-d` alone means devices only.
             show_status = status or not devices
@@ -412,6 +571,7 @@ class OktaPlugin(ConnectorPlugin):
                 _print_devices(
                     identifier,
                     okta_id=result.properties.get("okta_id"),
+                    window=window,
                     # With `-d` alone the devices ARE the answer, so a failure
                     # is a failed command. Alongside `-s` the status is already
                     # on screen, so it degrades that one section instead.
@@ -446,7 +606,9 @@ class OktaPlugin(ConnectorPlugin):
                 table.add_row(key, str(value) if value is not None else "-")
             console.print(table)
 
-        def _print_devices(identifier: str, okta_id: str | None, primary: bool) -> None:
+        def _print_devices(
+            identifier: str, okta_id: str | None, primary: bool, window: timedelta | None = None
+        ) -> None:
             result = asyncio.run(self.fetch_devices(identifier, okta_id=okta_id))
 
             if not result.ok:
@@ -468,12 +630,43 @@ class OktaPlugin(ConnectorPlugin):
             # squeezes seven down until the serial renders as an empty cell.
             # Serial is the field an offboarding operator actually needs, so
             # it never wraps -- the name gives way instead.
+            signins: dict[str, str] = {}
+            signins_failed = False
+            if window is not None:
+                # Only the devices we are about to print, so paging can stop
+                # as soon as they are all accounted for.
+                wanted = {d["device_id"] for d in found if d.get("device_id")}
+                signin_result = asyncio.run(
+                    self.fetch_device_signins(
+                        result.properties.get("okta_id") or okta_id or identifier,
+                        since=window,
+                        device_ids=wanted or None,
+                    )
+                )
+                if signin_result.ok:
+                    signins = signin_result.data["signins"]
+                else:
+                    # The inventory is a real answer on its own; losing sign-in
+                    # times degrades one column rather than discarding it.
+                    signins_failed = True
+                    console.print(f"[yellow]Sign-in times unavailable:[/yellow] {signin_result.error}")
+
             table = Table(title=f"Devices ({result.data['count']}) - {identifier}")
             table.add_column("name")
             table.add_column("platform")
-            table.add_column("model")
+            # `model` gives way when the sign-in column is present. Six columns
+            # re-create the 80-column squeeze that dropping from seven to five
+            # fixed: model truncates to "MacBook..." and status wraps to three
+            # lines. Of the two, model is the least actionable -- serial
+            # identifies the machine and platform says what it is.
+            if window is None:
+                table.add_column("model")
             table.add_column("serial", no_wrap=True)
             table.add_column("status")
+            if window is not None:
+                # The window is in the header, not a footnote: a blank cell
+                # means "not in this window", never "never used".
+                table.add_column(f"last sign-in ({describe_window(window)})", no_wrap=True)
             for device in found:
                 platform = " ".join(
                     part for part in (device["platform"], device["os_version"]) if part
@@ -481,13 +674,17 @@ class OktaPlugin(ConnectorPlugin):
                 state = " / ".join(
                     part for part in (device["status"], device["management_status"]) if part
                 )
-                table.add_row(
-                    device["display_name"] or "-",
-                    platform or "-",
-                    device["model"] or "-",
-                    device["serial_number"] or "-",
-                    state or "-",
-                )
+                row = [device["display_name"] or "-", platform or "-"]
+                if window is None:
+                    row.append(device["model"] or "-")
+                row += [device["serial_number"] or "-", state or "-"]
+                if window is not None:
+                    if signins_failed:
+                        row.append("?")
+                    else:
+                        stamp = signins.get(device.get("device_id") or "")
+                        row.append(stamp[:10] if stamp else "-")
+                table.add_row(*row)
             console.print(table)
 
         return sub_app
