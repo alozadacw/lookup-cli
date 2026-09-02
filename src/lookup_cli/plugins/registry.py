@@ -12,6 +12,7 @@ from importlib.metadata import entry_points
 from typing import Iterator
 
 from lookup_cli.plugins.base import ConnectorPlugin
+from lookup_cli.plugins.config import PluginConfig
 
 ENTRY_POINT_GROUP = "lookup_cli.plugins"
 
@@ -20,14 +21,21 @@ class PluginLoadError(RuntimeError):
     """Raised when a registered entry point doesn't satisfy the plugin contract."""
 
 
-def discover_plugins() -> dict[str, ConnectorPlugin]:
+def discover_plugins(config: PluginConfig | None = None) -> dict[str, ConnectorPlugin]:
     """Load and instantiate every registered plugin.
+
+    `config` is built once here and injected into every plugin, so each
+    connector does not read the environment for itself and core can tell
+    which plugins are actually configured.
 
     Returns a dict keyed by plugin `.name`. Raises PluginLoadError with
     a clear message if an entry point doesn't resolve to a valid
     ConnectorPlugin subclass -- fail loud at startup, not silently at
     lookup time.
     """
+    if config is None:
+        config = PluginConfig.from_env()
+
     plugins: dict[str, ConnectorPlugin] = {}
     for ep in _iter_entry_points():
         try:
@@ -43,7 +51,16 @@ def discover_plugins() -> dict[str, ConnectorPlugin]:
                 f"ConnectorPlugin subclass."
             )
 
-        instance = plugin_cls()
+        try:
+            instance = plugin_cls(config)
+        except TypeError as exc:
+            raise PluginLoadError(
+                f"Plugin '{ep.name}' ({ep.value}) could not be constructed with a "
+                f"PluginConfig. Connector plugins must accept one via "
+                f"ConnectorPlugin.__init__ -- if you overrode __init__, call "
+                f"super().__init__(config). Underlying error: {exc}"
+            ) from exc
+
         if not getattr(instance, "name", None):
             raise PluginLoadError(
                 f"Plugin loaded from entry point '{ep.name}' has no `name` attribute."

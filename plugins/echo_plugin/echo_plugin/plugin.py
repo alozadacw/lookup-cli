@@ -17,16 +17,22 @@ To build a real connector (e.g. Jamf):
 from __future__ import annotations
 
 from lookup_cli.plugins.base import ConnectorPlugin, ConnectorResult
+from lookup_cli.redaction import safe_error
 
 
 class EchoStandalonePlugin(ConnectorPlugin):
     name = "echo_standalone"
 
-    def fetch(self, identifier: str) -> ConnectorResult:
+    async def fetch(self, identifier: str) -> ConnectorResult:
         try:
-            data = self._call_backend(identifier)
+            data = await self._call_backend(identifier)
         except Exception as exc:  # noqa: BLE001 - deliberately broad: never crash aggregation
-            return ConnectorResult(plugin_name=self.name, identifier=identifier, error=str(exc))
+            # safe_error, never str(exc): this string is persisted to the
+            # SQLite cache and printed, and a real connector's exceptions
+            # carry URLs and auth headers. See lookup_cli/redaction.py.
+            return ConnectorResult(
+                plugin_name=self.name, identifier=identifier, error=safe_error(exc)
+            )
 
         return ConnectorResult(
             plugin_name=self.name,
@@ -35,7 +41,13 @@ class EchoStandalonePlugin(ConnectorPlugin):
             tags=["template-plugin"],
         )
 
-    def _call_backend(self, identifier: str) -> dict:
-        # Replace this with a real API call. Keep it as its own method
-        # so tests can monkeypatch/mock it cleanly.
+    async def _call_backend(self, identifier: str) -> dict:
+        # Replace this with a real API call (httpx.AsyncClient). Keep it as
+        # its own method so tests can monkeypatch/mock it cleanly, and so
+        # swapping mock-mode for real-mode is a one-method change:
+        #
+        #     if self.mock_mode:
+        #         return self._mock_fixture(identifier)
+        #     token = self.config.require("ECHO_API_TOKEN")
+        #
         return {"echoed": identifier}

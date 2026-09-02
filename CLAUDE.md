@@ -19,12 +19,16 @@ fails, **stop and report it rather than patching around it** — that means
 the scaffold has a real bug, and `docs/STAGES.md` checkboxes should not
 be flipped until it's fixed.
 
-Expected green state as of 2026-08-19 (verified on Python 3.14.0,
+Expected green state as of 2026-08-25 (verified on Python 3.13.15,
 macOS/arm64): `lookup-cli plugins list` shows two rows — `echo` (built-in)
-and `echo_standalone` (the template package) — and 15 tests pass (13 from
-the root `tests/` run + 2 in `plugins/echo_plugin/tests/`, which the root
-run does not collect; see Stage 0 in `docs/STAGES.md`). Coverage is 87%,
-with `config.py` at 0% because nothing exercises `Settings` yet.
+and `echo_standalone` (the template package) — and **52 tests pass in a
+single `pytest` run at 96% coverage**. Plugin packages' own tests are now
+collected by the root run (`testpaths = ["tests", "plugins"]` with
+`--import-mode=importlib`), so there is no longer a separate count to
+reconcile.
+
+Python: install 3.13 via `brew install python@3.13`. macOS ships only
+3.9, which is below `requires-python`, and bootstrap will refuse to run.
 
 Then:
 
@@ -35,20 +39,20 @@ Then:
    `LOOKUP_CLI_MOCK_*=1` flags as-is — no credentials for those yet.
 2. **Resolve or triage the Open Decisions Log** at the bottom of
    `docs/STAGES.md` before starting Stage 2-3 implementation work —
-   at minimum, flag which ones block starting vs. which can wait:
-   - Per-plugin cache TTLs
-   - Jira: `reporter` vs. `assignee` for "tickets submitted"
-   - ABM auth path (Apple direct API vs. MDM vendor proxy) — doesn't
-     block Stage 5's mock-first work, but blocks the real-API follow-up
-   - Whether per-plugin CLI subcommands stay centralized in `cli.py`
-     or move into each plugin package
-   - Supported Python versions (CI pins 3.11, local dev is on 3.14)
-   - Whether `plugins/*/tests` should be collected by the root `pytest`
-3. **Two known gaps worth closing before Stage 2** (both tracked in
-   `docs/STAGES.md`): the root `pytest` run doesn't collect
-   `plugins/*/tests`, and `config.py`'s `Settings` loader has no tests
-   despite Stage 2 being about to depend on it for Okta credentials.
-4. **Only after the above**, pick up the next unchecked task in
+   at minimum, flag which ones block starting vs. which can wait. Two
+   are hard blockers for the first real connector, because both are
+   breaking changes once five plugins exist:
+   - **`fetch()` sync vs. async** — serial aggregation costs the sum of
+     five round trips, and `async def` later breaks every plugin
+   - **How plugins receive credentials** — `base.py` defines no
+     `__init__`, so today each plugin calls `os.getenv` itself and core
+     can't tell configured from unconfigured
+
+   The rest can wait: per-plugin TTLs, Jira `reporter` vs. `assignee`
+   (blocks Stage 3 only), ABM auth path (blocks the real-API follow-up,
+   not Stage 5's mock work), and whether per-plugin CLI subcommands stay
+   centralized in `cli.py`.
+3. **Only after the above**, pick up the next unchecked task in
    `docs/STAGES.md` (Stage 2, Okta, is next — real credentials are
    already available for it) and follow the TDD loop in "When picking
    up a task" below.
@@ -108,12 +112,19 @@ service never requires touching core code. Full rationale in
    `docs/STAGES.md` Stage 8, which exists specifically to catch this).
 3. **New connector plugin -> follow `docs/CONNECTOR_GUIDE.md` exactly.**
    Copy `plugins/echo_plugin/` as the starting point, don't write one
-   from scratch.
+   from scratch. Two contract points that are easy to miss: `fetch()` is
+   `async def`, and credentials come from the injected `self.config`
+   (`PluginConfig`) — never `os.getenv`. Declare what you need in
+   `required_credentials` so `plugins list` can report it.
 4. **`fetch()` must never raise for ordinary failures** (not found,
    auth error, timeout, 5xx). Catch and return `ConnectorResult(error=...)`.
-   Only let genuine bugs propagate.
+   Only let genuine bugs propagate. **Build that error string with
+   `safe_error(exc)` from `lookup_cli.redaction`, never `str(exc)`** —
+   it gets persisted to the SQLite cache and printed, and raw client
+   exceptions carry URLs and auth headers.
 5. **Secrets stay in `.env` / env vars, never in code, tests, git
-   history, or fixtures.** Fixtures use obviously-fake values.
+   history, or fixtures.** Fixtures use obviously-fake values. gitleaks
+   runs on every PR, but it's a backstop, not permission to be casual.
 6. **Check `docs/STAGES.md` before starting work.** It's the live task
    board -- update checkboxes as you complete tasks, and add newly
    discovered tasks/decisions to the "Open decisions log" at the bottom
@@ -123,10 +134,15 @@ service never requires touching core code. Full rationale in
 
 ```
 src/lookup_cli/            core (registry, cache, models, cli, base contract)
+src/lookup_cli/redaction.py  secret scrubbing for connector error strings
+src/lookup_cli/plugins/config.py  PluginConfig injected into every connector
 plugins/echo_plugin/       template plugin package -- copy for new connectors
-tests/unit/framework/      Stage 0 tests
-tests/unit/cache/          Stage 1 tests
-tests/cli/                 aggregation/CLI tests (Stage 7)
+plugins/okta_plugin/       Stage 2 connector -- the reference *real* service
+tests/unit/framework/      Stage 0 tests (registry, redaction)
+tests/unit/cache/          Stage 1 tests (cache, retention)
+tests/unit/config/         Stage 1 tests (Settings loader)
+tests/cli/                 aggregation/CLI tests (Stage 7) + cache commands
+plugins/*/tests/           each connector's own tests (collected by root pytest)
 docs/ARCHITECTURE.md       why the system is shaped this way
 docs/CONNECTOR_GUIDE.md    how to add a new service, step by step
 docs/STAGES.md             the project plan / task board
@@ -144,20 +160,49 @@ pytest -m cache                           # Stage 1
 pytest -m okta / jira / jamf / abm / allwhere / cli   # per-stage/plugin
 pytest --cov=src/lookup_cli               # full suite with coverage
 lookup-cli plugins list
+lookup-cli cache path|clear|purge         # local PII cache: inspect / empty
+lookup-cli okta <user>                    # status (default view)
+lookup-cli okta <user> -d                 # devices only;  -sd for both
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
 
+Marker runs cover plugin packages too, so `pytest -m okta` will include
+`plugins/okta_plugin/tests/` once it exists — provided that test file sets
+`pytestmark = pytest.mark.okta`.
+
 ## Current state (update this section as stages complete)
 
-- Stage 0 (plugin framework): **verified green** 2026-08-19 — installed
-  and run against real deps on Python 3.14.0. 5 tests pass under
-  `-m plugin_framework`; `lookup-cli plugins list` shows `echo` and
-  `echo_standalone`. Remaining: CI needs one real PR run, and
-  `testpaths` needs fixing to collect per-plugin tests.
-- Stage 1 (cache/data model): **verified green** 2026-08-19 — 8 tests
-  pass under `-m cache`. `cache.py` 100% covered, `config.py` 0%
-  (untested `Settings` loader).
-- Stages 2-8: not started. See `docs/STAGES.md` for the full breakdown.
+- Stage 0 (plugin framework): **verified green** 2026-08-25 on Python
+  3.13.15. 57 tests under `-m plugin_framework` (includes the plugin
+  package's own tests now); `lookup-cli plugins list` shows `echo` and
+  `echo_standalone` with a configured/mock/missing status column.
+  `testpaths` gap closed; `safe_error()` scrubbing added to the contract;
+  `fetch()` is now `async def`; credentials arrive via an injected
+  `PluginConfig`.
+- Stage 1 (cache/data model): **verified green** 2026-08-25 — 30 tests
+  under `-m cache`. `cache.py` and `config.py` both 100%. Expiry now
+  deletes rows; `lookup-cli cache clear|purge` added; DB is `0600` in a
+  `0700` directory.
+- Stage 2 (Okta): **mocks green** 2026-08-26 — `pytest -m okta` 49 passed.
+  `plugins/okta_plugin/` implements the real client; `lookup-cli okta
+  <user>` works with `-s/--status` and `-d/--devices` selecting sections
+  (bare = status), and `LOOKUP_CLI_MOCK_OKTA=1` runs any of them with no
+  credentials. **CLI shape is `<service> <identifier> [flags]` for every
+  connector** — no noun subcommands; see the CLI shape note at the top of
+  `docs/STAGES.md` before adding a stage's CLI. **Outstanding: the manual smoke test
+  against the real org**, blocked on a real `OKTA_API_TOKEN` in `.env`.
+  Note `-d` shows Okta's *device registry* (Okta Verify / device trust),
+  not hardware inventory — Jamf/ABM are the authoritative sources and will
+  legitimately disagree.
+- Whole suite: 151 tests, 98% coverage, single `pytest` run.
+- Stages 3-8: not started. Both contract decisions (async `fetch()`,
+  injected `PluginConfig`) are resolved and implemented, so Jira (Stage 3)
+  is a straight copy of the Okta shape.
+- Okta credentials: currently a **personal read-only API token**, not a
+  service account (decided 2026-08-25 to unblock development). Okta SSWS
+  tokens act as their creating user and expire after ~30 days of
+  inactivity — swap to a dedicated service account before this goes to
+  more than one operator. Tracked in the Open Decisions Log.
 - Okta and Jira have real credentials available now; Jamf, ABM, and
   allwhere are mock-first until credentials are provisioned.
 

@@ -8,16 +8,39 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor declared by requires-python; 3.13 is what local
+        # development runs on. Testing both stops CI from silently diverging
+        # from developer machines (see the decisions log in docs/STAGES.md).
+        python-version: ["3.11", "3.13"]
+    name: pytest (py${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install core + dev deps
         run: pip install -e ".[dev]"
-      - name: Install template plugin
-        run: pip install -e plugins/echo_plugin
-      # As real connector plugins are added under plugins/<name>_plugin,
-      # add one `pip install -e plugins/<name>_plugin` line each here.
+      # Every plugin package under plugins/, globbed rather than listed, so a
+      # new connector needs no edit here. Their tests are then collected
+      # automatically (testpaths includes plugins).
+      - name: Install plugin packages
+        run: |
+          for manifest in plugins/*/pyproject.toml; do
+            pip install -e "$(dirname "$manifest")"
+          done
       - name: Run test suite
         run: pytest --cov=src/lookup_cli --cov-report=term-missing
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks scans history, not just the tip commit
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

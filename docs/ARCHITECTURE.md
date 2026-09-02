@@ -97,5 +97,19 @@ Jamf/ABM/allwhere get built *before* credentials exist.
 - No REPL/interactive shell (subcommands only, per project decision).
 - No secrets manager/keychain integration (env vars/.env, per project
   decision) -- revisit if this becomes a multi-user shared tool.
-- No async/concurrency in the aggregator yet -- Stage 7 adds concurrent
-  fetches once there are enough real plugins to make it worth it.
+  Credentials reach plugins through an injected `PluginConfig` (see
+  `src/lookup_cli/plugins/config.py`), not via each plugin calling
+  `os.getenv`; that is what lets core report an unconfigured plugin
+  before a lookup rather than during one.
+
+## Resolved since v1 scoping
+
+- **`fetch()` is async.** Originally listed as a non-goal ("no
+  async/concurrency in the aggregator yet"). Reversed 2026-08-25 and done
+  up front instead: with five HTTP services a serial aggregate costs the
+  *sum* of five round trips, and changing the signature after five
+  connectors exist is a breaking change to every one of them. Stage 7
+  gathers with `asyncio.gather`.
+- **Connector errors are scrubbed.** `fetch()` never raising means every
+  ordinary failure becomes a cached, printed string; `safe_error()` in
+  `src/lookup_cli/redaction.py` strips credentials out of it first.
