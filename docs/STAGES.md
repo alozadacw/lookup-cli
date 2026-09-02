@@ -101,6 +101,7 @@ real token in `.env`).
 | [x] Add `okta` marker to `pyproject.toml` pytest markers | -- |
 | [x] `-d/--devices` — devices registered to a user | plugin implemented |
 | [x] `-s/--status` — account status, flagging deactivated explicitly | plugin implemented |
+| [x] Surface the `access_blocked` custom profile attribute under status | plugin implemented |
 
 Notes from the implementation:
 
@@ -126,6 +127,24 @@ Notes from the implementation:
   the whole answer, so a device-API failure exits 1 and scripts can trust it.
   With `-sd` the status is already a real answer on screen, so the same failure
   degrades just that section and exits 0.
+- **`access blocked` comes from the profile, not the status enum.** This org's
+  Universal Directory defines a custom attribute (Profile Editor label
+  "ACCESS BLOCKED", variable name `access_blocked`) that arrives inside the
+  `profile` object of the payload `fetch()` already retrieves — so it costs no
+  extra request. It is shown **verbatim**: a boolean renders `true`/`false`
+  rather than being translated to yes/no, so an operator sees exactly what the
+  Okta admin UI shows them. Absent or null renders `-`, kept deliberately
+  distinct from an explicit `false` — "nobody ever set this" is not the same
+  claim as "this person is not blocked". The attribute name is configurable via
+  `OKTA_ACCESS_ATTRIBUTE`, since custom attribute names are org-specific and
+  hardcoding ours would break the plugin for any other Okta org.
+  - Only the one configured attribute is read, never the whole profile: Okta
+    profiles routinely carry manager, employee id and personal contact details,
+    and everything in `data` is written to the plaintext local cache.
+  - It sits next to `status` rather than replacing it. If the attribute is
+    synced from Workday/AD it can lag the real account state, and a
+    disagreement between the two is exactly what an offboarding check wants to
+    surface.
 - **`-s` translates the enum.** Okta has eight statuses; "deactivated" in the
   admin UI means `DEPROVISIONED` specifically, and `SUSPENDED` is a different
   state that also blocks login. The CLI prints a verdict line

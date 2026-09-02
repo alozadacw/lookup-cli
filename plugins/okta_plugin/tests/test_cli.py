@@ -369,3 +369,120 @@ def test_mock_mode_end_to_end():
     assert result.exit_code == 0
     assert "ACTIVE" in _out(result)
     assert "C02MOCK00001" in _out(result)
+
+
+# --- access blocked row -----------------------------------------------------------
+#
+# `profile.access_blocked` is a custom Universal Directory attribute (Profile
+# Editor label "ACCESS BLOCKED"). Whatever Okta returns is displayed verbatim
+# -- no translating booleans into yes/no -- so an operator sees the same value
+# the Okta admin UI shows them.
+
+
+def _user_with_access(value, key: str = "access_blocked") -> dict:
+    payload = _user_payload()
+    payload["profile"][key] = value
+    return payload
+
+
+def _row_value(output: str, field: str) -> str | None:
+    """Pull one field's value out of the rendered rich table."""
+    for line in output.splitlines():
+        cells = [c.strip() for c in line.strip().strip("│").split("│")]
+        if len(cells) == 2 and cells[0] == field:
+            return cells[1]
+    return None
+
+
+@respx.mock
+def test_string_value_is_shown_exactly_as_okta_returns_it():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    result = runner.invoke(_app(), ["okta", "jdoe"])
+
+    assert _row_value(_out(result), "access blocked") == "ACCESS BLOCKED"
+
+
+@respx.mock
+def test_boolean_true_renders_as_json_true_not_python_True():
+    """Okta's JSON says `true`; Python's str() would say `True`. Verbatim
+    means matching what the API actually returned."""
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(True))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "true"
+
+
+@respx.mock
+def test_boolean_false_renders_as_false_not_as_a_dash():
+    """An explicit `false` is a real answer and must not look like "unset"."""
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(False))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "false"
+
+
+@respx.mock
+def test_unset_attribute_renders_as_a_dash():
+    """The common case in this org -- the attribute exists but nobody set it."""
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "-"
+
+
+@respx.mock
+def test_null_attribute_renders_as_a_dash():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(None))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "-"
+
+
+@respx.mock
+def test_numeric_value_is_also_passed_through():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(1))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "1"
+
+
+@respx.mock
+def test_the_row_sits_directly_under_status():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    lines = [line for line in _out(runner.invoke(_app(), ["okta", "jdoe"])).splitlines()]
+    status_at = next(i for i, line in enumerate(lines) if "│ status " in line)
+    access_at = next(i for i, line in enumerate(lines) if "access blocked" in line)
+
+    assert access_at == status_at + 1
+
+
+@respx.mock
+def test_the_row_is_labelled_in_plain_words_not_the_raw_variable_name():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe"]))
+
+    assert "access blocked" in out
+
+
+@respx.mock
+def test_devices_only_view_does_not_show_the_row():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+    respx.get(DEVICES_URL).mock(return_value=httpx.Response(200, json=[_device_link()]))
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d"]))
+
+    assert "access blocked" not in out

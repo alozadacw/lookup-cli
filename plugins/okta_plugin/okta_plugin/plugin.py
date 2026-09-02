@@ -26,12 +26,25 @@ Required env vars (see `.env.example`):
     OKTA_API_TOKEN      an SSWS token
 Optional:
     OKTA_TIMEOUT_SECONDS        per-request timeout (default 10)
+    OKTA_ACCESS_ATTRIBUTE       custom profile attribute carrying this org's
+                                access decision (default `access_blocked`)
     LOOKUP_CLI_MOCK_OKTA=1      serve a fixture instead of calling out
+
+**Custom profile attribute.** This org's Universal Directory defines an
+attribute displayed in the Profile Editor as "ACCESS BLOCKED", variable
+name `access_blocked`. It arrives inside the `profile` object of the user
+payload we already fetch, so reading it costs no extra request. Its value
+is reported verbatim -- a boolean stays `true`/`false` rather than becoming
+yes/no -- so an operator sees exactly what the Okta admin UI shows. Only
+the one configured attribute is read: Okta profiles routinely carry
+manager, employee id and personal contact details, and everything in
+`data` is written to the plaintext local cache.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from urllib.parse import quote
 
 import httpx
@@ -51,12 +64,41 @@ _ACTIVE_STATUSES = frozenset({"ACTIVE"})
 #: can't hang the CLI. Far above any real user's device count.
 _MAX_PAGES = 20
 
+#: Custom Universal Directory attribute carrying this org's access decision.
+#: Shown in the Okta Profile Editor as "ACCESS BLOCKED" with the variable
+#: name `access_blocked`. Custom attribute names are org-specific, so the
+#: name is overridable via OKTA_ACCESS_ATTRIBUTE rather than hardcoded.
+DEFAULT_ACCESS_ATTRIBUTE = "access_blocked"
+
+#: Label for that value in CLI output.
+ACCESS_FIELD_LABEL = "access blocked"
+
 #: Okta's status enum has eight values, and the raw name is not always what
 #: an operator needs to read. "Deactivated" in the Okta admin UI means
 #: DEPROVISIONED specifically -- SUSPENDED also blocks login but is a
 #: different state, and conflating them would mislead someone checking
 #: whether an offboarding actually completed.
 _DEACTIVATED_STATUS = "DEPROVISIONED"
+
+
+def format_profile_value(raw: object) -> str:
+    """Render a profile attribute exactly as Okta returned it.
+
+    No interpretation: a boolean stays a boolean rather than becoming
+    yes/no, so an operator sees the same value the Okta admin UI shows.
+    `json.dumps` rather than `str` for non-strings, because Okta's JSON says
+    `true` while Python's `str(True)` says `True`.
+
+    An absent or null attribute has nothing to render verbatim, so it falls
+    back to the table's usual empty marker -- which keeps it distinct from
+    an explicit `false`.
+    """
+    if raw is None:
+        return "-"
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw)
+
 
 _STATUS_NOTES: dict[str, tuple[str, str]] = {
     "ACTIVE": ("green", ""),
@@ -73,6 +115,10 @@ _STATUS_NOTES: dict[str, tuple[str, str]] = {
 class OktaPlugin(ConnectorPlugin):
     name = "okta"
     required_credentials = ("OKTA_ORG_URL", "OKTA_API_TOKEN")
+
+    @property
+    def _access_attribute(self) -> str:
+        return self.config.get("OKTA_ACCESS_ATTRIBUTE") or DEFAULT_ACCESS_ATTRIBUTE
 
     async def fetch(self, identifier: str) -> ConnectorResult:
         try:
@@ -216,6 +262,9 @@ class OktaPlugin(ConnectorPlugin):
                 "lastName": "User",
                 "email": f"{identifier}@example.com",
                 "login": identifier,
+                # Fictional value; the real attribute's type is org-defined
+                # and this connector does not care which it is.
+                DEFAULT_ACCESS_ATTRIBUTE: False,
             },
         }
 
@@ -276,6 +325,10 @@ class OktaPlugin(ConnectorPlugin):
             data={
                 "found": True,
                 "status": status,
+                # Verbatim: whatever Okta returned, uninterpreted. Placed
+                # right after `status` so the CLI's ordered walk renders the
+                # row directly beneath it.
+                "access_blocked": profile.get(self._access_attribute),
                 # Derived, but worth carrying: it is the single question
                 # offboarding actually asks, and it keeps every consumer
                 # (CLI, Stage 7 aggregation, JSON output) from re-deriving
@@ -383,7 +436,11 @@ class OktaPlugin(ConnectorPlugin):
             # `found` and `deactivated` are derived and already stated in the
             # line above; repeating them here is noise.
             for key, value in result.data.items():
-                if key not in ("found", "deactivated"):
+                if key in ("found", "deactivated"):
+                    continue
+                if key == "access_blocked":
+                    table.add_row(ACCESS_FIELD_LABEL, format_profile_value(value))
+                else:
                     table.add_row(key, str(value) if value is not None else "-")
             for key, value in result.properties.items():
                 table.add_row(key, str(value) if value is not None else "-")
