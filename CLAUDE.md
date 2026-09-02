@@ -163,6 +163,9 @@ lookup-cli plugins list
 lookup-cli cache path|clear|purge         # local PII cache: inspect / empty
 lookup-cli okta <user>                    # status (default view)
 lookup-cli okta <user> -d                 # devices only;  -sd for both
+lookup-cli okta <user> -a                 # applications;  -apps / --apps
+lookup-cli okta <user> -u                 # authenticators; -authenticators
+lookup-cli okta <user> -sdau              # all four sections
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
 
@@ -183,18 +186,27 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
   under `-m cache`. `cache.py` and `config.py` both 100%. Expiry now
   deletes rows; `lookup-cli cache clear|purge` added; DB is `0600` in a
   `0700` directory.
-- Stage 2 (Okta): **mocks green** 2026-08-26 — `pytest -m okta` 49 passed.
-  `plugins/okta_plugin/` implements the real client; `lookup-cli okta
-  <user>` works with `-s/--status` and `-d/--devices` selecting sections
-  (bare = status), and `LOOKUP_CLI_MOCK_OKTA=1` runs any of them with no
-  credentials. **CLI shape is `<service> <identifier> [flags]` for every
-  connector** — no noun subcommands; see the CLI shape note at the top of
-  `docs/STAGES.md` before adding a stage's CLI. **Outstanding: the manual smoke test
-  against the real org**, blocked on a real `OKTA_API_TOKEN` in `.env`.
+- Stage 2 (Okta): **mocks green** 2026-09-02 — `pytest -m okta` 208 passed.
+  `plugins/okta_plugin/` implements the real client. Four sections select
+  via flags (bare = status), and `LOOKUP_CLI_MOCK_OKTA=1` runs any of them
+  with no credentials:
+  - `-s`/`--status` — account status, `access_blocked`, deactivation
+  - `-d`/`--devices` — Okta device registry (`--last-signin` adds per-device
+    sign-in times from the System Log)
+  - `-a`/`-apps`/`--apps` — assigned applications
+  - `-u`/`-authenticators`/`--authenticators` — enrolled MFA factors
+
+  **CLI shape is `<service> <identifier> [flags]` for every connector** —
+  no noun subcommands, and flags bundle (`-sdau`). Read the CLI shape note
+  at the top of `docs/STAGES.md` before adding a stage's CLI: it covers the
+  three-spellings-per-section rule and the two ways a flag name can silently
+  misparse. **Outstanding: the manual smoke test against the real org**,
+  blocked on a real `OKTA_API_TOKEN` in `.env` — it is now the only
+  unchecked Stage 2 task.
   Note `-d` shows Okta's *device registry* (Okta Verify / device trust),
   not hardware inventory — Jamf/ABM are the authoritative sources and will
   legitimately disagree.
-- Whole suite: 151 tests, 98% coverage, single `pytest` run.
+- Whole suite: 310 tests, 98% coverage, single `pytest` run.
 - Stages 3-8: not started. Both contract decisions (async `fetch()`,
   injected `PluginConfig`) are resolved and implemented, so Jira (Stage 3)
   is a straight copy of the Okta shape.

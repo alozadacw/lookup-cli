@@ -21,17 +21,49 @@ seen. It is deliberately a separate call, not part of `fetch()`, because
 Stage 7 runs `fetch()` for every plugin on every lookup and shouldn't pay
 for a second round trip nobody asked for.
 
+**Applications.** `fetch_apps()` (`okta <user> -a`) reads
+`GET /api/v1/users/{userId}/appLinks`, the list behind the user's Okta
+dashboard. It answers "what can this person open", not "how were they
+granted it" -- direct-vs-group assignment lives on
+`/apps/{appId}/users/{userId}` and would cost one request per app, so it
+is not fetched. Hidden tiles are included: a hidden app is still an
+assignment, and an offboarding check that skipped them would under-report.
+
+**Authenticators.** `fetch_authenticators()` (`okta <user> -u`) reads
+`GET /api/v1/users/{userId}/factors`. The API says "factor", the Okta
+admin console says "authenticator"; the CLI follows the console and the
+API's word is kept for anything touching the wire. `profile.questionText`
+is deliberately dropped -- that a security question is enrolled is the
+useful fact, while the question itself is a recovery-credential hint with
+no operational value here. Phone numbers and emails are shown exactly as
+Okta returns them, which is already partially masked for SMS.
+
 Required env vars (see `.env.example`):
     OKTA_ORG_URL        e.g. https://acme.okta.com
     OKTA_API_TOKEN      an SSWS token
 Optional:
     OKTA_TIMEOUT_SECONDS        per-request timeout (default 10)
+    OKTA_ACCESS_ATTRIBUTE       custom profile attribute carrying this org's
+                                access decision (default `access_blocked`)
     LOOKUP_CLI_MOCK_OKTA=1      serve a fixture instead of calling out
+
+**Custom profile attribute.** This org's Universal Directory defines an
+attribute displayed in the Profile Editor as "ACCESS BLOCKED", variable
+name `access_blocked`. It arrives inside the `profile` object of the user
+payload we already fetch, so reading it costs no extra request. Its value
+is reported verbatim -- a boolean stays `true`/`false` rather than becoming
+yes/no -- so an operator sees exactly what the Okta admin UI shows. Only
+the one configured attribute is read: Okta profiles routinely carry
+manager, employee id and personal contact details, and everything in
+`data` is written to the plaintext local cache.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -51,12 +83,134 @@ _ACTIVE_STATUSES = frozenset({"ACTIVE"})
 #: can't hang the CLI. Far above any real user's device count.
 _MAX_PAGES = 20
 
+#: Custom Universal Directory attribute carrying this org's access decision.
+#: Shown in the Okta Profile Editor as "ACCESS BLOCKED" with the variable
+#: name `access_blocked`. Custom attribute names are org-specific, so the
+#: name is overridable via OKTA_ACCESS_ATTRIBUTE rather than hardcoded.
+DEFAULT_ACCESS_ATTRIBUTE = "access_blocked"
+
+#: Label for that value in CLI output.
+ACCESS_FIELD_LABEL = "access blocked"
+
+#: Okta retains System Log data for roughly 90 days. Asking for longer cannot
+#: return longer, and letting a caller believe otherwise would put a window in
+#: the column header that the data does not actually cover.
+MAX_LOG_WINDOW = timedelta(days=90)
+
+#: Sign-in events that can carry device identity.
+_SIGNIN_EVENT_TYPES = ("user.session.start", "user.authentication.sso")
+
+_SINCE_RE = re.compile(r"^\s*(\d+)\s*([dh])\s*$", re.IGNORECASE)
+
+
+def parse_since(raw: str) -> timedelta:
+    """Parse a `--since` window like `90d` or `12h`, clamped to retention."""
+    match = _SINCE_RE.match(raw or "")
+    if not match:
+        raise ValueError(
+            f"could not parse --since {raw!r}. Use a number followed by "
+            f"'d' (days) or 'h' (hours), e.g. 30d or 12h."
+        )
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise ValueError("--since must be greater than zero.")
+    window = timedelta(days=amount) if match.group(2).lower() == "d" else timedelta(hours=amount)
+    return min(window, MAX_LOG_WINDOW)
+
+
+def describe_window(window: timedelta) -> str:
+    """Short label for a window, for the column header."""
+    if window >= timedelta(days=1) and window.total_seconds() % 86400 == 0:
+        return f"{int(window.total_seconds() // 86400)}d"
+    return f"{int(window.total_seconds() // 3600)}h"
+
 #: Okta's status enum has eight values, and the raw name is not always what
 #: an operator needs to read. "Deactivated" in the Okta admin UI means
 #: DEPROVISIONED specifically -- SUSPENDED also blocks login but is a
 #: different state, and conflating them would mislead someone checking
 #: whether an offboarding actually completed.
 _DEACTIVATED_STATUS = "DEPROVISIONED"
+
+
+def format_profile_value(raw: object) -> str:
+    """Render a profile attribute exactly as Okta returned it.
+
+    No interpretation: a boolean stays a boolean rather than becoming
+    yes/no, so an operator sees the same value the Okta admin UI shows.
+    `json.dumps` rather than `str` for non-strings, because Okta's JSON says
+    `true` while Python's `str(True)` says `True`.
+
+    An absent or null attribute has nothing to render verbatim, so it falls
+    back to the table's usual empty marker -- which keeps it distinct from
+    an explicit `false`.
+    """
+    if raw is None:
+        return "-"
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw)
+
+
+#: Okta's `factorType` values are wire identifiers, not something an operator
+#: should have to decode -- `token:software:totp` is the clearest example.
+#: Anything absent falls through to the raw value: Okta keeps adding
+#: authenticator types, and inventing a label for one we don't recognise
+#: would be worse than showing what the API actually said.
+_FACTOR_LABELS: dict[str, str] = {
+    "push": "Okta Verify push",
+    "signed_nonce": "Okta FastPass",
+    "webauthn": "WebAuthn / passkey",
+    "u2f": "Security key (U2F)",
+    "sms": "SMS",
+    "call": "Voice call",
+    "email": "Email",
+    "question": "Security question",
+    "token:software:totp": "TOTP app",
+    "token:hardware": "Hardware token",
+    "token": "Token",
+    "password": "Password",
+}
+
+#: Profile keys that identify *which* authenticator this is, best first. A
+#: named device beats the credential id behind it, because the name is what an
+#: operator recognises. `questionText` is deliberately absent -- see the module
+#: docstring.
+_FACTOR_DETAIL_FIELDS = ("name", "authenticatorName", "phoneNumber", "email", "credentialId")
+
+#: Anything unrecognised stays yellow rather than green: an unknown state is
+#: not evidence that an authenticator is fine.
+_FACTOR_STATUS_COLOURS: dict[str, str] = {
+    "ACTIVE": "green",
+    "PENDING_ACTIVATION": "yellow",
+    "NOT_SETUP": "yellow",
+    "INACTIVE": "red",
+    "DISABLED": "red",
+    "EXPIRED": "red",
+}
+
+
+def factor_label(factor_type: str | None, provider: str | None) -> str | None:
+    """Readable name for an authenticator, keeping a non-Okta provider visible.
+
+    A Duo push and an Okta Verify push are different systems to go and revoke,
+    so the provider is named whenever it isn't Okta's own.
+    """
+    if not factor_type:
+        return None
+    label = _FACTOR_LABELS.get(factor_type, factor_type)
+    if provider and provider.upper() != "OKTA":
+        label = f"{label} ({provider})"
+    return label
+
+
+def factor_detail(profile: dict | None) -> str | None:
+    """The most identifying value on a factor profile, or None."""
+    for key in _FACTOR_DETAIL_FIELDS:
+        value = (profile or {}).get(key)
+        if value:
+            return str(value)
+    return None
+
 
 _STATUS_NOTES: dict[str, tuple[str, str]] = {
     "ACTIVE": ("green", ""),
@@ -73,6 +227,10 @@ _STATUS_NOTES: dict[str, tuple[str, str]] = {
 class OktaPlugin(ConnectorPlugin):
     name = "okta"
     required_credentials = ("OKTA_ORG_URL", "OKTA_API_TOKEN")
+
+    @property
+    def _access_attribute(self) -> str:
+        return self.config.get("OKTA_ACCESS_ATTRIBUTE") or DEFAULT_ACCESS_ATTRIBUTE
 
     async def fetch(self, identifier: str) -> ConnectorResult:
         try:
@@ -105,16 +263,14 @@ class OktaPlugin(ConnectorPlugin):
         for ordinary failures.
         """
         try:
+            okta_id = await self._resolve_okta_id(identifier, okta_id)
             if okta_id is None:
-                user = await self._call_backend(identifier)
-                if user is None:
-                    return ConnectorResult(
-                        plugin_name=self.name,
-                        identifier=identifier,
-                        data={"found": False, "devices": [], "count": 0},
-                        tags=["not-found"],
-                    )
-                okta_id = user.get("id")
+                return ConnectorResult(
+                    plugin_name=self.name,
+                    identifier=identifier,
+                    data={"found": False, "devices": [], "count": 0},
+                    tags=["not-found"],
+                )
 
             raw_devices = await self._call_devices_backend(okta_id)
         except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
@@ -133,15 +289,211 @@ class OktaPlugin(ConnectorPlugin):
             tags=["no-devices"] if not devices else ["has-devices"],
         )
 
+    async def fetch_apps(self, identifier: str, *, okta_id: str | None = None) -> ConnectorResult:
+        """List the applications assigned to `identifier` in Okta.
+
+        Answers "what can this person open", not "how were they granted it" --
+        see the module docstring. Like `fetch()`, never raises for ordinary
+        failures.
+        """
+        try:
+            resolved = await self._resolve_okta_id(identifier, okta_id)
+            if resolved is None:
+                return ConnectorResult(
+                    plugin_name=self.name,
+                    identifier=identifier,
+                    data={"found": False, "apps": [], "count": 0},
+                    tags=["not-found"],
+                )
+            raw_apps = await self._call_apps_backend(resolved)
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=identifier,
+                error=safe_error(exc, secrets=[self.config.get("OKTA_API_TOKEN")]),
+            )
+
+        # Okta returns dashboard sort order, which is per-user and arbitrary.
+        # Alphabetical means two people's app lists can actually be compared.
+        apps = sorted(
+            (self._to_app(entry) for entry in raw_apps),
+            key=lambda app: (app["label"] or "").lower(),
+        )
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=identifier,
+            data={"found": True, "apps": apps, "count": len(apps)},
+            properties={"okta_id": resolved},
+            tags=["no-apps"] if not apps else ["has-apps"],
+        )
+
+    async def fetch_authenticators(
+        self, identifier: str, *, okta_id: str | None = None
+    ) -> ConnectorResult:
+        """List the authenticators (API: "factors") enrolled by `identifier`.
+
+        Includes inactive and half-finished enrolments: a disabled
+        authenticator is still enrolled, and an offboarding check wants the
+        whole picture rather than only what currently works.
+        """
+        try:
+            resolved = await self._resolve_okta_id(identifier, okta_id)
+            if resolved is None:
+                return ConnectorResult(
+                    plugin_name=self.name,
+                    identifier=identifier,
+                    data={"found": False, "authenticators": [], "count": 0},
+                    tags=["not-found"],
+                )
+            raw_factors = await self._call_factors_backend(resolved)
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=identifier,
+                error=safe_error(exc, secrets=[self.config.get("OKTA_API_TOKEN")]),
+            )
+
+        factors = sorted(
+            (self._to_factor(entry) for entry in raw_factors),
+            key=lambda f: ((f["label"] or "").lower(), (f["detail"] or "").lower()),
+        )
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=identifier,
+            data={"found": True, "authenticators": factors, "count": len(factors)},
+            properties={"okta_id": resolved},
+            tags=["no-authenticators"] if not factors else ["has-authenticators"],
+        )
+
+    async def fetch_device_signins(
+        self,
+        okta_id: str,
+        *,
+        since: timedelta,
+        device_ids: set[str] | None = None,
+    ) -> ConnectorResult:
+        """Most recent successful sign-in per device, from the System Log.
+
+        `/users/{id}/devices` has no last-login field -- its `lastUpdated`
+        tracks changes to the device *record*, not sign-ins -- so this is a
+        separate source correlated on `device.id`.
+
+        Pass `device_ids` when the caller knows which devices it cares about:
+        results come back newest-first, so once every device has been seen the
+        remaining pages cannot change the answer and paging stops early. That
+        matters because /api/v1/logs is Okta's most rate-limited endpoint.
+        """
+        try:
+            signins = await self._call_logs_backend(okta_id, since, device_ids)
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=okta_id,
+                error=safe_error(exc, secrets=[self.config.get("OKTA_API_TOKEN")]),
+            )
+
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=okta_id,
+            data={"signins": signins, "window": describe_window(since)},
+        )
+
     # -- backend seam ---------------------------------------------------------
 
-    async def _call_devices_backend(self, okta_id: str) -> list[dict]:
+    async def _call_logs_backend(
+        self, okta_id: str, since: timedelta, device_ids: set[str] | None
+    ) -> dict[str, str]:
         if self.mock_mode:
-            return self._mock_devices_fixture()
+            return self._mock_signins_fixture()
 
         org_url = self.config.require("OKTA_ORG_URL").rstrip("/")
-        url = f"{org_url}/api/v1/users/{quote(okta_id, safe='')}/devices"
+        event_filter = " or ".join(f'eventType eq "{e}"' for e in _SIGNIN_EVENT_TYPES)
+        params = {
+            "since": (datetime.now(timezone.utc) - since).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "filter": f'actor.id eq "{okta_id}" and ({event_filter})',
+            "sortOrder": "DESCENDING",
+            "limit": "1000",
+        }
 
+        url = f"{org_url}/api/v1/logs"
+        signins: dict[str, str] = {}
+        seen_urls: set[str] = set()
+        first = True
+
+        async with self._client() as client:
+            for _ in range(_MAX_PAGES):
+                if url in seen_urls:
+                    break
+                seen_urls.add(url)
+
+                response = await client.get(
+                    url, headers=self._headers(), params=params if first else None
+                )
+                first = False
+                if response.status_code in (401, 403):
+                    raise RuntimeError(
+                        "Okta refused the System Log request. This API token may lack "
+                        "System Log read access, which is granted separately from user "
+                        "read access."
+                    )
+                response.raise_for_status()
+
+                for event in response.json():
+                    if (event.get("outcome") or {}).get("result") != "SUCCESS":
+                        continue
+                    device_id = (event.get("device") or {}).get("id")
+                    if not device_id:
+                        # Not every auth event stamps a device. Guessing from
+                        # the user agent could not tell two MacBooks apart, so
+                        # an unattributable event is dropped rather than
+                        # assigned to the wrong machine.
+                        continue
+                    # DESCENDING: the first sighting is the most recent.
+                    signins.setdefault(device_id, event.get("published"))
+
+                if device_ids and device_ids.issubset(signins):
+                    break
+
+                next_url = response.links.get("next", {}).get("url")
+                if not next_url:
+                    break
+                url = next_url
+
+        return signins
+
+    def _mock_signins_fixture(self) -> dict[str, str]:
+        return {"guoMOCK00000000000001": "2026-01-01T09:15:00.000Z"}
+
+
+    async def _resolve_okta_id(self, identifier: str, okta_id: str | None) -> str | None:
+        """Turn a login into an Okta id, or None when there's no such user.
+
+        Callers that already resolved the user (as the CLI does when several
+        sections are on screen) pass `okta_id` and skip the round trip.
+        """
+        if okta_id is not None:
+            return okta_id
+        user = await self._call_backend(identifier)
+        return None if user is None else user.get("id")
+
+    def _user_url(self, okta_id: str, suffix: str) -> str:
+        org_url = self.config.require("OKTA_ORG_URL").rstrip("/")
+        # quote(safe="") so an id or login can't walk off /api/v1/users.
+        return f"{org_url}/api/v1/users/{quote(okta_id, safe='')}/{suffix}"
+
+    async def _fetch_all_pages(
+        self, url: str, *, on_404: str | None = None, on_denied: str | None = None
+    ) -> list[dict]:
+        """Follow Okta's `Link: rel="next"` pagination and concatenate pages.
+
+        Shared by every list endpoint here. Under-reporting someone's devices,
+        apps or authenticators is the worst failure this tool has, so stopping
+        at page one is never the answer -- and one implementation means the
+        three call sites can't quietly drift apart.
+
+        `on_404` / `on_denied` turn a status code into an actionable message
+        for endpoints where the generic HTTP error would mislead.
+        """
         entries: list[dict] = []
         seen_urls: set[str] = set()
 
@@ -152,19 +504,13 @@ class OktaPlugin(ConnectorPlugin):
                 seen_urls.add(url)
 
                 response = await client.get(url, headers=self._headers())
-                if response.status_code == 404:
-                    # The user exists (we just resolved them), so a 404 here
-                    # means the device API itself is unavailable -- typically
-                    # an Okta Classic org. Say that, don't say "not found".
-                    raise RuntimeError(
-                        "Okta returned 404 for the device endpoint. This org may not "
-                        "have Okta Identity Engine device management enabled, or the "
-                        "API token may lack the devices scope."
-                    )
+                if response.status_code == 404 and on_404:
+                    raise RuntimeError(on_404)
+                if response.status_code in (401, 403) and on_denied:
+                    raise RuntimeError(on_denied)
                 response.raise_for_status()
 
-                page = response.json()
-                entries.extend(page)
+                entries.extend(response.json())
 
                 next_url = response.links.get("next", {}).get("url")
                 if not next_url:
@@ -172,6 +518,48 @@ class OktaPlugin(ConnectorPlugin):
                 url = next_url
 
         return entries
+
+    async def _call_devices_backend(self, okta_id: str) -> list[dict]:
+        if self.mock_mode:
+            return self._mock_devices_fixture()
+
+        return await self._fetch_all_pages(
+            self._user_url(okta_id, "devices"),
+            # The user exists (we just resolved them), so a 404 here means the
+            # device API itself is unavailable -- typically an Okta Classic
+            # org. Say that, don't say "not found".
+            on_404=(
+                "Okta returned 404 for the device endpoint. This org may not "
+                "have Okta Identity Engine device management enabled, or the "
+                "API token may lack the devices scope."
+            ),
+        )
+
+    async def _call_apps_backend(self, okta_id: str) -> list[dict]:
+        if self.mock_mode:
+            return self._mock_apps_fixture()
+
+        return await self._fetch_all_pages(
+            self._user_url(okta_id, "appLinks"),
+            on_denied=(
+                "Okta refused the app list request. This API token may lack "
+                "application read access, which is granted separately from "
+                "user read access."
+            ),
+        )
+
+    async def _call_factors_backend(self, okta_id: str) -> list[dict]:
+        if self.mock_mode:
+            return self._mock_factors_fixture()
+
+        return await self._fetch_all_pages(
+            self._user_url(okta_id, "factors"),
+            on_denied=(
+                "Okta refused the authenticator request. This API token may lack "
+                "factor read access, which is granted separately from user read "
+                "access."
+            ),
+        )
 
     async def _call_backend(self, identifier: str) -> dict | None:
         """Return the raw Okta user payload, or None if there's no such user."""
@@ -216,6 +604,9 @@ class OktaPlugin(ConnectorPlugin):
                 "lastName": "User",
                 "email": f"{identifier}@example.com",
                 "login": identifier,
+                # Fictional value; the real attribute's type is org-defined
+                # and this connector does not care which it is.
+                DEFAULT_ACCESS_ATTRIBUTE: False,
             },
         }
 
@@ -240,7 +631,68 @@ class OktaPlugin(ConnectorPlugin):
             }
         ]
 
+    def _mock_apps_fixture(self) -> list[dict]:
+        return [
+            {
+                "id": "0oaMOCK00000000000001",
+                "label": "Mock Google Workspace",
+                "appName": "google",
+                "hidden": False,
+            },
+            {
+                "id": "0oaMOCK00000000000002",
+                "label": "Mock Slack",
+                "appName": "slack",
+                "hidden": True,
+            },
+        ]
+
+    def _mock_factors_fixture(self) -> list[dict]:
+        return [
+            {
+                "id": "opfMOCK00000000000001",
+                "factorType": "push",
+                "provider": "OKTA",
+                "status": "ACTIVE",
+                "created": "2025-06-11T08:12:00.000Z",
+                "profile": {"name": "Mock iPhone"},
+            },
+            {
+                "id": "opfMOCK00000000000002",
+                "factorType": "token:software:totp",
+                "provider": "OKTA",
+                "status": "ACTIVE",
+                "created": "2025-06-11T08:14:00.000Z",
+                "profile": {"credentialId": "mock@example.com"},
+            },
+        ]
+
     # -- shaping --------------------------------------------------------------
+
+    @staticmethod
+    def _to_app(entry: dict) -> dict:
+        return {
+            "app_id": entry.get("id") or entry.get("appInstanceId"),
+            "label": entry.get("label"),
+            "app_name": entry.get("appName"),
+            # A hidden tile is still an assignment. Recorded rather than
+            # filtered, so the CLI can say so instead of silently omitting it.
+            "hidden": bool(entry.get("hidden")),
+        }
+
+    @staticmethod
+    def _to_factor(entry: dict) -> dict:
+        factor_type = entry.get("factorType")
+        provider = entry.get("provider")
+        return {
+            "factor_id": entry.get("id"),
+            "factor_type": factor_type,
+            "provider": provider,
+            "label": factor_label(factor_type, provider),
+            "detail": factor_detail(entry.get("profile")),
+            "status": entry.get("status"),
+            "created": entry.get("created"),
+        }
 
     @staticmethod
     def _to_device(entry: dict) -> dict:
@@ -252,6 +704,7 @@ class OktaPlugin(ConnectorPlugin):
         device = entry.get("device") or entry
         profile = device.get("profile") or {}
         return {
+            "device_id": device.get("id") or entry.get("id"),
             "display_name": profile.get("displayName"),
             "platform": profile.get("platform"),
             "manufacturer": profile.get("manufacturer"),
@@ -276,6 +729,10 @@ class OktaPlugin(ConnectorPlugin):
             data={
                 "found": True,
                 "status": status,
+                # Verbatim: whatever Okta returned, uninterpreted. Placed
+                # right after `status` so the CLI's ordered walk renders the
+                # row directly beneath it.
+                "access_blocked": profile.get(self._access_attribute),
                 # Derived, but worth carrying: it is the single question
                 # offboarding actually asks, and it keeps every consumer
                 # (CLI, Stage 7 aggregation, JSON output) from re-deriving
@@ -337,11 +794,58 @@ class OktaPlugin(ConnectorPlugin):
                 help="List devices registered to this user in Okta "
                 "(Okta Verify / device trust -- not the Jamf or ABM inventory).",
             ),
+            apps: bool = typer.Option(
+                False,
+                "--apps",
+                "-apps",
+                "-a",
+                help="List applications assigned to this user, hidden tiles "
+                "included. Shows what they can open, not how it was granted.",
+            ),
+            authenticators: bool = typer.Option(
+                False,
+                "--authenticators",
+                "-authenticators",
+                "-u",
+                help="List authenticators (MFA factors) this user has enrolled, "
+                "including inactive ones.",
+            ),
+            last_signin: bool = typer.Option(
+                False,
+                "--last-signin",
+                help="Add each device's most recent sign-in, from the Okta System "
+                "Log. Opt-in: it costs an extra call to a rate-limited endpoint. "
+                "Implies --devices.",
+            ),
+            since: str = typer.Option(
+                "90d",
+                "--since",
+                help="Window for --last-signin, e.g. 30d or 12h. Okta retains "
+                "System Log data for about 90 days, which is the maximum.",
+            ),
         ) -> None:
             """Look one person up in Okta."""
+            # Asking for per-device sign-ins obviously means you want the
+            # device table; requiring -d as well would just be pedantry.
+            if last_signin:
+                devices = True
+
+            window = None
+            if last_signin:
+                try:
+                    window = parse_since(since)
+                except ValueError as exc:
+                    console.print(f"[red]Invalid --since:[/red] {exc}")
+                    raise typer.Exit(code=2)
+
             # Flags select sections. With none given, status is what people
             # want; `-d` alone means devices only.
-            show_status = status or not devices
+            show_status = status or not (devices or apps or authenticators)
+
+            # A section that is the *whole* answer must fail the command, so
+            # scripts can trust the exit code. Alongside other sections a dead
+            # endpoint degrades its own row instead of discarding good output.
+            sole_section = sum((show_status, devices, apps, authenticators)) == 1
 
             result = asyncio.run(self.fetch(identifier))
             if not result.ok:
@@ -352,18 +856,19 @@ class OktaPlugin(ConnectorPlugin):
                 console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
                 return
 
+            okta_id = result.properties.get("okta_id")
+
             if show_status:
                 _print_status(identifier, result)
 
             if devices:
-                _print_devices(
-                    identifier,
-                    okta_id=result.properties.get("okta_id"),
-                    # With `-d` alone the devices ARE the answer, so a failure
-                    # is a failed command. Alongside `-s` the status is already
-                    # on screen, so it degrades that one section instead.
-                    primary=not show_status,
-                )
+                _print_devices(identifier, okta_id=okta_id, window=window, primary=sole_section)
+
+            if apps:
+                _print_apps(identifier, okta_id=okta_id, primary=sole_section)
+
+            if authenticators:
+                _print_authenticators(identifier, okta_id=okta_id, primary=sole_section)
 
         def _print_status(identifier: str, result: ConnectorResult) -> None:
             status_value = result.data.get("status") or "UNKNOWN"
@@ -383,13 +888,91 @@ class OktaPlugin(ConnectorPlugin):
             # `found` and `deactivated` are derived and already stated in the
             # line above; repeating them here is noise.
             for key, value in result.data.items():
-                if key not in ("found", "deactivated"):
+                if key in ("found", "deactivated"):
+                    continue
+                if key == "access_blocked":
+                    table.add_row(ACCESS_FIELD_LABEL, format_profile_value(value))
+                else:
                     table.add_row(key, str(value) if value is not None else "-")
             for key, value in result.properties.items():
                 table.add_row(key, str(value) if value is not None else "-")
             console.print(table)
 
-        def _print_devices(identifier: str, okta_id: str | None, primary: bool) -> None:
+        def _print_apps(identifier: str, okta_id: str | None, primary: bool) -> None:
+            result = asyncio.run(self.fetch_apps(identifier, okta_id=okta_id))
+
+            if not result.ok:
+                console.print(f"[red]Applications unavailable:[/red] {result.error}")
+                if primary:
+                    raise typer.Exit(code=1)
+                return
+
+            if not result.data.get("found", True):
+                console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
+                return
+
+            apps = result.data["apps"]
+            if not apps:
+                console.print(
+                    f"[yellow]No applications assigned in Okta to[/yellow] {identifier}"
+                )
+                return
+
+            table = Table(title=f"Applications ({result.data['count']}) - {identifier}")
+            table.add_column("app")
+            table.add_column("type")
+            # Named for the API field rather than inverted to "visible": an
+            # operator reading the table should not have to flip the sense of
+            # the column in their head to match what Okta told us.
+            table.add_column("hidden")
+            for app in apps:
+                table.add_row(
+                    app["label"] or "-",
+                    app["app_name"] or "-",
+                    "yes" if app["hidden"] else "no",
+                )
+            console.print(table)
+
+        def _print_authenticators(identifier: str, okta_id: str | None, primary: bool) -> None:
+            result = asyncio.run(self.fetch_authenticators(identifier, okta_id=okta_id))
+
+            if not result.ok:
+                console.print(f"[red]Authenticators unavailable:[/red] {result.error}")
+                if primary:
+                    raise typer.Exit(code=1)
+                return
+
+            if not result.data.get("found", True):
+                console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
+                return
+
+            factors = result.data["authenticators"]
+            if not factors:
+                console.print(f"[yellow]No authenticators enrolled in Okta by[/yellow] {identifier}")
+                return
+
+            table = Table(title=f"Authenticators ({result.data['count']}) - {identifier}")
+            table.add_column("type")
+            # `detail` is the field that says *which* authenticator this is --
+            # two Okta Verify pushes are only distinguishable by device name --
+            # so it never wraps. The type label gives way instead.
+            table.add_column("detail", no_wrap=True)
+            table.add_column("status")
+            table.add_column("enrolled", no_wrap=True)
+            for factor in factors:
+                colour = _FACTOR_STATUS_COLOURS.get(factor["status"], "yellow")
+                status_value = factor["status"] or "UNKNOWN"
+                table.add_row(
+                    factor["label"] or "-",
+                    factor["detail"] or "-",
+                    f"[{colour}]{status_value}[/{colour}]",
+                    (factor["created"] or "")[:10] or "-",
+                )
+            console.print(table)
+
+        def _print_devices(
+            identifier: str, okta_id: str | None, primary: bool, window: timedelta | None = None
+        ) -> None:
             result = asyncio.run(self.fetch_devices(identifier, okta_id=okta_id))
 
             if not result.ok:
@@ -411,12 +994,43 @@ class OktaPlugin(ConnectorPlugin):
             # squeezes seven down until the serial renders as an empty cell.
             # Serial is the field an offboarding operator actually needs, so
             # it never wraps -- the name gives way instead.
+            signins: dict[str, str] = {}
+            signins_failed = False
+            if window is not None:
+                # Only the devices we are about to print, so paging can stop
+                # as soon as they are all accounted for.
+                wanted = {d["device_id"] for d in found if d.get("device_id")}
+                signin_result = asyncio.run(
+                    self.fetch_device_signins(
+                        result.properties.get("okta_id") or okta_id or identifier,
+                        since=window,
+                        device_ids=wanted or None,
+                    )
+                )
+                if signin_result.ok:
+                    signins = signin_result.data["signins"]
+                else:
+                    # The inventory is a real answer on its own; losing sign-in
+                    # times degrades one column rather than discarding it.
+                    signins_failed = True
+                    console.print(f"[yellow]Sign-in times unavailable:[/yellow] {signin_result.error}")
+
             table = Table(title=f"Devices ({result.data['count']}) - {identifier}")
             table.add_column("name")
             table.add_column("platform")
-            table.add_column("model")
+            # `model` gives way when the sign-in column is present. Six columns
+            # re-create the 80-column squeeze that dropping from seven to five
+            # fixed: model truncates to "MacBook..." and status wraps to three
+            # lines. Of the two, model is the least actionable -- serial
+            # identifies the machine and platform says what it is.
+            if window is None:
+                table.add_column("model")
             table.add_column("serial", no_wrap=True)
             table.add_column("status")
+            if window is not None:
+                # The window is in the header, not a footnote: a blank cell
+                # means "not in this window", never "never used".
+                table.add_column(f"last sign-in ({describe_window(window)})", no_wrap=True)
             for device in found:
                 platform = " ".join(
                     part for part in (device["platform"], device["os_version"]) if part
@@ -424,13 +1038,17 @@ class OktaPlugin(ConnectorPlugin):
                 state = " / ".join(
                     part for part in (device["status"], device["management_status"]) if part
                 )
-                table.add_row(
-                    device["display_name"] or "-",
-                    platform or "-",
-                    device["model"] or "-",
-                    device["serial_number"] or "-",
-                    state or "-",
-                )
+                row = [device["display_name"] or "-", platform or "-"]
+                if window is None:
+                    row.append(device["model"] or "-")
+                row += [device["serial_number"] or "-", state or "-"]
+                if window is not None:
+                    if signins_failed:
+                        row.append("?")
+                    else:
+                        stamp = signins.get(device.get("device_id") or "")
+                        row.append(stamp[:10] if stamp else "-")
+                table.add_row(*row)
             console.print(table)
 
         return sub_app

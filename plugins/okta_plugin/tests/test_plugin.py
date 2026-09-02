@@ -272,3 +272,127 @@ async def test_mock_mode_works_with_no_credentials_and_no_network():
     assert result.ok
     assert result.data["status"] == "ACTIVE"
     assert plugin.configured is True
+
+
+# --- Custom profile attribute: access_blocked ---------------------------------
+#
+# Not an Okta status -- a custom Universal Directory attribute this org
+# defines (Profile Editor label "ACCESS BLOCKED", variable name
+# `access_blocked`). It arrives in the same payload `fetch()` already
+# retrieves, so surfacing it costs no extra request.
+#
+# The value is carried through verbatim: whatever Okta returns is what we
+# report, with no interpretation of booleans into yes/no.
+
+
+def _user_with(profile_extra: dict) -> dict:
+    payload = _okta_user()
+    payload["profile"].update(profile_extra)
+    return payload
+
+
+@respx.mock
+async def test_access_blocked_string_value_is_carried_verbatim():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with({"access_blocked": "ACCESS BLOCKED"}))
+    )
+
+    result = await _plugin().fetch("jdoe")
+
+    assert result.data["access_blocked"] == "ACCESS BLOCKED"
+
+
+@pytest.mark.parametrize("value", [True, False])
+@respx.mock
+async def test_boolean_values_are_carried_without_translation(value):
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with({"access_blocked": value}))
+    )
+
+    result = await _plugin().fetch("jdoe")
+
+    assert result.data["access_blocked"] is value
+
+
+@respx.mock
+async def test_absent_attribute_is_none_not_an_error():
+    """The common case: the org defines the attribute but nobody set it."""
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_okta_user()))
+
+    result = await _plugin().fetch("jdoe")
+
+    assert result.ok
+    assert result.data["access_blocked"] is None
+
+
+@respx.mock
+async def test_explicit_null_is_none():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with({"access_blocked": None}))
+    )
+
+    result = await _plugin().fetch("jdoe")
+
+    assert result.data["access_blocked"] is None
+
+
+@respx.mock
+async def test_the_attribute_name_is_configurable():
+    """Custom UD attribute names are org-specific; don't hardcode ours into
+    a plugin that is meant to work against any Okta org."""
+    config = PluginConfig(
+        {
+            "OKTA_ORG_URL": ORG_URL,
+            "OKTA_API_TOKEN": "not-a-real-token",
+            "OKTA_ACCESS_ATTRIBUTE": "customAccessFlag",
+        }
+    )
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with({"customAccessFlag": "BLOCKED"}))
+    )
+
+    result = await _plugin(config).fetch("jdoe")
+
+    assert result.data["access_blocked"] == "BLOCKED"
+
+
+@respx.mock
+async def test_default_attribute_name_is_ignored_when_overridden():
+    """Overriding the name must actually redirect the read, not add to it."""
+    config = PluginConfig(
+        {
+            "OKTA_ORG_URL": ORG_URL,
+            "OKTA_API_TOKEN": "not-a-real-token",
+            "OKTA_ACCESS_ATTRIBUTE": "customAccessFlag",
+        }
+    )
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with({"access_blocked": "ACCESS BLOCKED"}))
+    )
+
+    result = await _plugin(config).fetch("jdoe")
+
+    assert result.data["access_blocked"] is None
+
+
+@respx.mock
+async def test_other_profile_attributes_are_not_swept_in():
+    """Only the configured attribute is read. Okta profiles routinely carry
+    manager, employee id, personal phone -- and everything in `data` is
+    written to the plaintext SQLite cache."""
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(
+            200,
+            json=_user_with({"access_blocked": "ACCESS BLOCKED", "personalPhone": "555-0100"}),
+        )
+    )
+
+    result = await _plugin().fetch("jdoe")
+
+    assert "555-0100" not in str(result.data) + str(result.properties)
+
+
+async def test_mock_mode_includes_the_attribute():
+    plugin = OktaPlugin(PluginConfig({"LOOKUP_CLI_MOCK_OKTA": "1"}))
+    result = await plugin.fetch("jdoe")
+    assert "access_blocked" in result.data

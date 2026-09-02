@@ -369,3 +369,591 @@ def test_mock_mode_end_to_end():
     assert result.exit_code == 0
     assert "ACTIVE" in _out(result)
     assert "C02MOCK00001" in _out(result)
+
+
+# --- access blocked row -----------------------------------------------------------
+#
+# `profile.access_blocked` is a custom Universal Directory attribute (Profile
+# Editor label "ACCESS BLOCKED"). Whatever Okta returns is displayed verbatim
+# -- no translating booleans into yes/no -- so an operator sees the same value
+# the Okta admin UI shows them.
+
+
+def _user_with_access(value, key: str = "access_blocked") -> dict:
+    payload = _user_payload()
+    payload["profile"][key] = value
+    return payload
+
+
+def _row_value(output: str, field: str) -> str | None:
+    """Pull one field's value out of the rendered rich table."""
+    for line in output.splitlines():
+        cells = [c.strip() for c in line.strip().strip("│").split("│")]
+        if len(cells) == 2 and cells[0] == field:
+            return cells[1]
+    return None
+
+
+@respx.mock
+def test_string_value_is_shown_exactly_as_okta_returns_it():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    result = runner.invoke(_app(), ["okta", "jdoe"])
+
+    assert _row_value(_out(result), "access blocked") == "ACCESS BLOCKED"
+
+
+@respx.mock
+def test_boolean_true_renders_as_json_true_not_python_True():
+    """Okta's JSON says `true`; Python's str() would say `True`. Verbatim
+    means matching what the API actually returned."""
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(True))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "true"
+
+
+@respx.mock
+def test_boolean_false_renders_as_false_not_as_a_dash():
+    """An explicit `false` is a real answer and must not look like "unset"."""
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(False))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "false"
+
+
+@respx.mock
+def test_unset_attribute_renders_as_a_dash():
+    """The common case in this org -- the attribute exists but nobody set it."""
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "-"
+
+
+@respx.mock
+def test_null_attribute_renders_as_a_dash():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(None))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "-"
+
+
+@respx.mock
+def test_numeric_value_is_also_passed_through():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access(1))
+    )
+
+    assert _row_value(_out(runner.invoke(_app(), ["okta", "jdoe"])), "access blocked") == "1"
+
+
+@respx.mock
+def test_the_row_sits_directly_under_status():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    lines = [line for line in _out(runner.invoke(_app(), ["okta", "jdoe"])).splitlines()]
+    status_at = next(i for i, line in enumerate(lines) if "│ status " in line)
+    access_at = next(i for i, line in enumerate(lines) if "access blocked" in line)
+
+    assert access_at == status_at + 1
+
+
+@respx.mock
+def test_the_row_is_labelled_in_plain_words_not_the_raw_variable_name():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe"]))
+
+    assert "access blocked" in out
+
+
+@respx.mock
+def test_devices_only_view_does_not_show_the_row():
+    respx.get(f"{USERS_URL}/jdoe").mock(
+        return_value=httpx.Response(200, json=_user_with_access("ACCESS BLOCKED"))
+    )
+    respx.get(DEVICES_URL).mock(return_value=httpx.Response(200, json=[_device_link()]))
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d"]))
+
+    assert "access blocked" not in out
+
+
+# --- --last-signin ------------------------------------------------------------------
+#
+# Opt-in modifier on the devices view. Long-only by convention: short flags are
+# section selectors (-s, -d), long flags modify how a section renders. That
+# keeps -sd meaning "two sections" and leaves -l/-g/-a free for future sections.
+
+LOGS_URL = f"{ORG_URL}/api/v1/logs"
+MBP = "guoMACBOOK00000000001"
+
+
+def _device_with_id(device_id: str, serial: str, name: str) -> dict:
+    entry = _device_link(serial=serial, name=name)
+    entry["id"] = device_id
+    entry["device"]["id"] = device_id
+    return entry
+
+
+def _signin_event(device_id: str, published: str) -> dict:
+    return {
+        "published": published,
+        "eventType": "user.session.start",
+        "outcome": {"result": "SUCCESS"},
+        "device": {"id": device_id},
+    }
+
+
+def _mock_devices_and_logs(events: list[dict] | None = None, log_status: int = 200):
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+    respx.get(DEVICES_URL).mock(
+        return_value=httpx.Response(200, json=[_device_with_id(MBP, "C02XYZ123ABC", "Jane's MBP")])
+    )
+    respx.get(LOGS_URL).mock(return_value=httpx.Response(log_status, json=events or []))
+
+
+@respx.mock
+def test_devices_alone_has_no_signin_column():
+    _mock_devices_and_logs()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d"]))
+
+    assert "last sign-in" not in out
+
+
+@respx.mock
+def test_devices_alone_does_not_touch_the_rate_limited_log_endpoint():
+    respx.get(f"{USERS_URL}/jdoe").mock(return_value=httpx.Response(200, json=_user_payload()))
+    respx.get(DEVICES_URL).mock(
+        return_value=httpx.Response(200, json=[_device_with_id(MBP, "C02XYZ123ABC", "Jane's MBP")])
+    )
+    logs = respx.get(LOGS_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    runner.invoke(_app(), ["okta", "jdoe", "-d"])
+
+    assert not logs.called
+
+
+@respx.mock
+def test_last_signin_adds_the_column_with_a_date():
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "last sign-in" in out
+    assert "2026-08-28" in out
+
+
+@respx.mock
+def test_last_signin_implies_devices():
+    """Asking for per-device sign-ins obviously means you want the device table."""
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "--last-signin"])
+
+    assert result.exit_code == 0
+    assert "C02XYZ123ABC" in _out(result)
+
+
+@respx.mock
+def test_device_with_no_signin_in_the_window_shows_a_placeholder():
+    """Must not read as "never used" -- the window is all we can see."""
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "last sign-in" in out
+
+
+@respx.mock
+def test_column_header_states_the_window():
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]))
+
+    assert "90d" in out
+
+
+@respx.mock
+def test_since_narrows_the_window_and_the_header_follows():
+    _mock_devices_and_logs([])
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin", "--since", "30d"]))
+
+    assert "30d" in out
+
+
+@respx.mock
+def test_invalid_since_is_rejected_with_a_clear_message():
+    _mock_devices_and_logs([])
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin", "--since", "banana"])
+
+    assert result.exit_code != 0
+    assert "since" in _out(result).lower()
+
+
+@respx.mock
+def test_a_log_failure_degrades_the_column_but_keeps_the_devices():
+    """The inventory is still a real answer; losing sign-in times shouldn't
+    discard it."""
+    _mock_devices_and_logs(log_status=403)
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    assert "C02XYZ123ABC" in out, "device inventory must survive"
+    assert "?" in out
+
+
+def test_help_documents_the_flag_and_since():
+    out = _out(runner.invoke(_app(), ["okta", "--help"]))
+
+    assert "--last-signin" in out
+    assert "--since" in out
+
+
+def test_last_signin_has_no_short_flag():
+    """Short flags are reserved for section selectors (-s, -d)."""
+    result = runner.invoke(_app(), ["okta", "jdoe", "-L"])
+
+    assert result.exit_code != 0
+
+
+def test_mock_mode_end_to_end_with_last_signin():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "-d", "--last-signin"])
+
+    assert result.exit_code == 0
+    assert "last sign-in" in _out(result)
+
+
+@respx.mock
+def test_model_gives_way_to_keep_the_table_readable_at_80_columns():
+    """Six columns re-create the squeeze that going seven-to-five fixed."""
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_devices_and_logs([_signin_event(MBP, "2026-08-28T14:31:00.000Z")])
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "jdoe", "-d", "--last-signin"]).stdout)
+
+    assert "C02XYZ123ABC" in out, "serial must never be squeezed out"
+    assert "2026-08-28" in out
+    assert "model" not in out
+
+
+@respx.mock
+def test_model_is_still_shown_without_the_signin_column():
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_devices_and_logs()
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "jdoe", "-d"]).stdout)
+
+    assert "model" in out
+
+
+# --- -a / -apps / --apps  and  -u / -authenticators / --authenticators ---------------
+#
+# Flag spelling decided 2026-09-02. Both a single-character short form and a
+# multi-character single-dash form are declared for each section, so `-a` can
+# bundle (`-sdau`) while `-apps` stays readable. `-sdapp` cannot be made to
+# work and is not a bug: Click decomposes a single-dash string it cannot match
+# as a whole into individual characters, so `-sdapp` reads as `-s -d -a -p -p`.
+
+APPS_URL = f"{USERS_URL}/{USER_ID}/appLinks"
+FACTORS_URL = f"{USERS_URL}/{USER_ID}/factors"
+
+
+def _app_link(label: str = "Google Workspace", app_name: str = "google") -> dict:
+    return {
+        "id": "0oa1gjh63g214q0Hq0g4",
+        "label": label,
+        "appName": app_name,
+        "hidden": False,
+        "sortOrder": 0,
+    }
+
+
+def _factor(factor_type: str = "push", profile: dict | None = None) -> dict:
+    return {
+        "id": f"opf-{factor_type}",
+        "factorType": factor_type,
+        "provider": "OKTA",
+        "status": "ACTIVE",
+        "created": "2025-06-11T08:12:00.000Z",
+        "profile": profile if profile is not None else {"name": "Jane's iPhone"},
+    }
+
+
+def _mock_everything(apps_status: int = 200, factors_status: int = 200):
+    _mock_user()
+    respx.get(DEVICES_URL).mock(return_value=httpx.Response(200, json=[_device_link()]))
+    respx.get(APPS_URL).mock(return_value=httpx.Response(apps_status, json=[_app_link()]))
+    respx.get(FACTORS_URL).mock(return_value=httpx.Response(factors_status, json=[_factor()]))
+
+
+@pytest.mark.parametrize("flag", ["-a", "-apps", "--apps"])
+@respx.mock
+def test_every_apps_spelling_shows_the_apps_table(flag):
+    _mock_everything()
+
+    result = runner.invoke(_app(), ["okta", "jdoe", flag])
+
+    assert result.exit_code == 0
+    assert "Google Workspace" in _out(result)
+
+
+@pytest.mark.parametrize("flag", ["-u", "-authenticators", "--authenticators"])
+@respx.mock
+def test_every_authenticators_spelling_shows_the_authenticators_table(flag):
+    _mock_everything()
+
+    result = runner.invoke(_app(), ["okta", "jdoe", flag])
+
+    assert result.exit_code == 0
+    assert "Okta Verify push" in _out(result)
+
+
+@respx.mock
+def test_apps_flag_alone_omits_the_other_sections():
+    """Flags select sections: `-a` means apps, not apps-and-everything-else."""
+    _mock_everything()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-a"]))
+
+    assert "Google Workspace" in out
+    assert "last_login" not in out, "status table must not appear"
+    assert "C02XYZ123ABC" not in out, "devices table must not appear"
+
+
+@respx.mock
+def test_apps_flag_alone_does_not_call_the_other_endpoints():
+    _mock_user()
+    devices = respx.get(DEVICES_URL).mock(return_value=httpx.Response(200, json=[]))
+    factors = respx.get(FACTORS_URL).mock(return_value=httpx.Response(200, json=[]))
+    respx.get(APPS_URL).mock(return_value=httpx.Response(200, json=[_app_link()]))
+
+    runner.invoke(_app(), ["okta", "jdoe", "-a"])
+
+    assert not devices.called
+    assert not factors.called
+
+
+@respx.mock
+def test_authenticators_flag_alone_does_not_call_the_apps_endpoint():
+    _mock_user()
+    apps = respx.get(APPS_URL).mock(return_value=httpx.Response(200, json=[]))
+    respx.get(FACTORS_URL).mock(return_value=httpx.Response(200, json=[_factor()]))
+
+    runner.invoke(_app(), ["okta", "jdoe", "-u"])
+
+    assert not apps.called
+
+
+@respx.mock
+def test_no_apps_message():
+    _mock_user()
+    respx.get(APPS_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-a"])
+
+    assert result.exit_code == 0
+    assert "No applications" in _out(result)
+
+
+@respx.mock
+def test_no_authenticators_message():
+    _mock_user()
+    respx.get(FACTORS_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-u"])
+
+    assert result.exit_code == 0
+    assert "No authenticators" in _out(result)
+
+
+# --- Bundling ---------------------------------------------------------------------
+
+
+@respx.mock
+def test_au_bundles_to_apps_and_authenticators():
+    """`-a` + `-u`, which is what the letters say. `-au` is deliberately NOT
+    declared as an option of its own: if it were, `-au` would mean
+    authenticators-only while `-sdau` still meant apps-and-authenticators, and
+    the same two letters would mean two different things."""
+    _mock_everything()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-au"]))
+
+    assert "Google Workspace" in out
+    assert "Okta Verify push" in out
+
+
+@respx.mock
+def test_sdau_shows_all_four_sections():
+    _mock_everything()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-sdau"]))
+
+    assert "ACTIVE" in out
+    assert "C02XYZ123ABC" in out
+    assert "Google Workspace" in out
+    assert "Okta Verify push" in out
+
+
+@respx.mock
+def test_bundle_order_does_not_matter():
+    _mock_everything()
+
+    assert _out(runner.invoke(_app(), ["okta", "jdoe", "-ua"])) == _out(
+        runner.invoke(_app(), ["okta", "jdoe", "-au"])
+    )
+
+
+@respx.mock
+def test_all_four_sections_resolve_the_user_only_once():
+    user_route = _mock_user()
+    respx.get(DEVICES_URL).mock(return_value=httpx.Response(200, json=[_device_link()]))
+    respx.get(APPS_URL).mock(return_value=httpx.Response(200, json=[_app_link()]))
+    respx.get(FACTORS_URL).mock(return_value=httpx.Response(200, json=[_factor()]))
+
+    runner.invoke(_app(), ["okta", "jdoe", "-sdau"])
+
+    assert user_route.call_count == 1
+
+
+@respx.mock
+def test_apps_flag_may_precede_the_identifier():
+    _mock_everything()
+
+    result = runner.invoke(_app(), ["okta", "-a", "jdoe"])
+
+    assert result.exit_code == 0
+    assert "Google Workspace" in _out(result)
+
+
+def test_sdapp_is_a_usage_error_not_a_silent_misparse():
+    """Documents a known limit. Click reads an unmatched single-dash string
+    character by character, so `-sdapp` is `-s -d -a -p -p` and there is no
+    `-p`. Failing loudly is the correct outcome; the working spelling is
+    `-sdau` or `-sd -apps`."""
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "-sdapp"])
+
+    assert result.exit_code == 2
+
+
+# --- Failure modes ----------------------------------------------------------------
+
+
+@respx.mock
+def test_an_apps_failure_alone_exits_non_zero():
+    _mock_everything(apps_status=403)
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-a"])
+
+    assert result.exit_code == 1
+
+
+@respx.mock
+def test_an_apps_failure_alongside_status_still_shows_the_status():
+    _mock_everything(apps_status=403)
+
+    result = runner.invoke(_app(), ["okta", "jdoe", "-sa"])
+
+    assert "ACTIVE" in _out(result)
+    assert "unavailable" in _out(result).lower()
+
+
+@respx.mock
+def test_an_authenticators_failure_does_not_discard_the_apps_table():
+    """Independent sections fail independently -- one dead endpoint should not
+    take a good answer off the screen."""
+    _mock_everything(factors_status=403)
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-au"]))
+
+    assert "Google Workspace" in out
+    assert "unavailable" in out.lower()
+
+
+@respx.mock
+def test_unknown_user_makes_no_apps_or_factors_call():
+    respx.get(f"{USERS_URL}/ghost").mock(return_value=httpx.Response(404))
+    others = respx.get(url__startswith=USERS_URL).mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    result = runner.invoke(_app(), ["okta", "ghost", "-au"])
+
+    assert result.exit_code == 0
+    assert "No Okta account" in _out(result)
+    assert not others.called
+
+
+# --- Help, layout, mock mode ---------------------------------------------------------
+
+
+def test_help_documents_every_spelling_of_the_new_flags():
+    out = _out(runner.invoke(_app(), ["okta", "--help"]))
+
+    for expected in ("-a", "-apps", "--apps", "-u", "-authenticators", "--authenticators"):
+        assert expected in out, f"{expected} missing from --help"
+
+
+def test_mock_mode_end_to_end_with_all_four_sections():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "-sdau"])
+
+    assert result.exit_code == 0
+    assert "ACTIVE" in _out(result)
+    assert "C02MOCK00001" in _out(result)
+
+
+@respx.mock
+def test_both_new_tables_stay_readable_at_80_columns():
+    """Two tables have already been squeezed unreadable at a stock 80-column
+    terminal; these are checked before anyone hits it."""
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_user()
+    respx.get(APPS_URL).mock(
+        return_value=httpx.Response(200, json=[_app_link("AWS Production Account", "amazon_aws")])
+    )
+    respx.get(FACTORS_URL).mock(
+        return_value=httpx.Response(
+            200, json=[_factor("webauthn", profile={"authenticatorName": "YubiKey 5C NFC"})]
+        )
+    )
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "jdoe", "-au"]).stdout)
+
+    assert "AWS Production Account" in out
+    assert "YubiKey 5C NFC" in out
+
+
+@respx.mock
+def test_the_security_question_text_never_reaches_the_terminal():
+    _mock_user()
+    respx.get(FACTORS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                _factor(
+                    "question",
+                    profile={"question": "favorite_art_piece", "questionText": "Favourite art?"},
+                )
+            ],
+        )
+    )
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe", "-u"]))
+
+    assert "Security question" in out
+    assert "Favourite art?" not in out
