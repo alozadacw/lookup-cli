@@ -6,8 +6,9 @@ room to add more services without touching core code.
 
 ```
 lookup-cli lookup jdoe               # aggregate across all installed plugins
-lookup-cli okta status jdoe          # single-service subcommand
-lookup-cli jira tickets jdoe
+lookup-cli okta jdoe                 # one service: status by default
+lookup-cli okta jdoe -d              # ...and its devices
+lookup-cli jira jdoe -t
 lookup-cli plugins list              # see what's installed
 ```
 

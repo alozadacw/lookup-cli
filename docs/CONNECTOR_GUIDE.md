@@ -141,12 +141,47 @@ Don't grow `ConnectorResult.data`'s schema for one-off extra fields --
 put them in `properties` (structured) or `tags` (labels). This is what
 the original spec's "leave room for optionals" requirement maps to.
 
-## 7. Wire the CLI subcommand
+## 7. Wire the CLI
 
-Add a `typer.Typer()` sub-app in the plugin package (or in
-`src/lookup_cli/cli.py` if you'd rather keep CLI wiring central --
-team's call per plugin) following the `plugins list` pattern in
-`cli.py`.
+Return a `typer.Typer` from your plugin's `cli()` method. Core mounts it
+under the plugin's name automatically, so **never add per-service wiring to
+`src/lookup_cli/cli.py`** -- that is what keeps ground rule 2 true and makes
+the Stage 8 claim (a new connector with zero core edits) hold.
+
+The shape is `lookup-cli <service> <identifier> [flags]`: the identifier is
+a direct argument on a callback, and flags select sections. No noun
+subcommands -- see "CLI shape" at the top of `docs/STAGES.md` for why.
+
+```python
+def cli(self) -> typer.Typer:
+    sub_app = typer.Typer(
+        help="Jamf lookups.",
+        # Without this, Click stops parsing options at the first positional:
+        # `jamf jdoe -d` fails while `jamf -d jdoe` works.
+        context_settings={"allow_interspersed_args": True},
+    )
+
+    @sub_app.callback(invoke_without_command=True)
+    def jamf(
+        identifier: str = typer.Argument(..., help="Username or email."),
+        devices: bool = typer.Option(False, "--devices", "-d", help="..."),
+    ) -> None:
+        """Look one person up in Jamf."""
+        ...
+
+    return sub_app
+```
+
+Two conventions worth copying from `okta_plugin`:
+
+- **Bare `<service> <identifier>` shows the primary view**; other flags are
+  additive.
+- **Exit codes follow what was asked for.** If a section the user explicitly
+  requested is the only thing they asked for, its failure should exit 1 so
+  scripts can trust it. If another section already answered them, degrade
+  that one section and exit 0.
+
+`asyncio.run(self.fetch(...))` bridges the async plugin to the sync CLI.
 
 ## 8. Install and verify
 
@@ -154,7 +189,7 @@ team's call per plugin) following the `plugins list` pattern in
 pip install -e plugins/<service>_plugin
 pytest -m <service>          # add the marker to pyproject.toml first
 lookup-cli plugins list      # confirm it shows up
-lookup-cli <service> <cmd> <identifier>
+lookup-cli <service> <identifier> [flags]
 ```
 
 ## 9. Document service-specific env vars

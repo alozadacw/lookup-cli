@@ -1,5 +1,5 @@
 """
-Stage 2: devices assigned to a user in Okta (`lookup-cli okta status -d`).
+Stage 2: devices assigned to a user in Okta (`lookup-cli okta <user> -d`).
 
 Scope note: this is Okta's device registry (Okta Verify / device trust),
 NOT the Jamf/ABM hardware inventory that Stages 4-5 will add. A user can

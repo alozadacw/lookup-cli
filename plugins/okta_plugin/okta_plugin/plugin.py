@@ -11,7 +11,7 @@ asks each connector to decide this explicitly: for an offboarding lookup,
 would make `UnifiedUserRecord.field_for("okta")` return None and be
 indistinguishable from "Okta was unreachable".
 
-**Devices.** `fetch_devices()` (surfaced as `okta status -d`) lists the
+**Devices.** `fetch_devices()` (surfaced as `okta <user> -d`) lists the
 devices Okta associates with a user, via
 `GET /api/v1/users/{userId}/devices`. Scope caveat worth repeating to
 users: this is Okta's own device registry -- machines enrolled through
@@ -51,6 +51,24 @@ _ACTIVE_STATUSES = frozenset({"ACTIVE"})
 #: can't hang the CLI. Far above any real user's device count.
 _MAX_PAGES = 20
 
+#: Okta's status enum has eight values, and the raw name is not always what
+#: an operator needs to read. "Deactivated" in the Okta admin UI means
+#: DEPROVISIONED specifically -- SUSPENDED also blocks login but is a
+#: different state, and conflating them would mislead someone checking
+#: whether an offboarding actually completed.
+_DEACTIVATED_STATUS = "DEPROVISIONED"
+
+_STATUS_NOTES: dict[str, tuple[str, str]] = {
+    "ACTIVE": ("green", ""),
+    "DEPROVISIONED": ("red", "deactivated"),
+    "SUSPENDED": ("red", "suspended"),
+    "LOCKED_OUT": ("yellow", "locked out"),
+    "PASSWORD_EXPIRED": ("yellow", "password expired"),
+    "RECOVERY": ("yellow", "in password recovery"),
+    "STAGED": ("yellow", "not yet activated"),
+    "PROVISIONED": ("yellow", "activation pending"),
+}
+
 
 class OktaPlugin(ConnectorPlugin):
     name = "okta"
@@ -82,9 +100,9 @@ class OktaPlugin(ConnectorPlugin):
     async def fetch_devices(self, identifier: str, *, okta_id: str | None = None) -> ConnectorResult:
         """List the devices Okta associates with `identifier`.
 
-        Pass `okta_id` when the caller already resolved the user (as
-        `status -d` does) to skip a redundant lookup. Like `fetch()`, this
-        never raises for ordinary failures.
+        Pass `okta_id` when the caller already resolved the user (as the CLI
+        does) to skip a redundant lookup. Like `fetch()`, this never raises
+        for ordinary failures.
         """
         try:
             if okta_id is None:
@@ -258,6 +276,11 @@ class OktaPlugin(ConnectorPlugin):
             data={
                 "found": True,
                 "status": status,
+                # Derived, but worth carrying: it is the single question
+                # offboarding actually asks, and it keeps every consumer
+                # (CLI, Stage 7 aggregation, JSON output) from re-deriving
+                # which of eight enum values means "deactivated".
+                "deactivated": status == _DEACTIVATED_STATUS,
                 "login": profile.get("login"),
                 "email": profile.get("email"),
                 "display_name": display_name,
@@ -276,30 +299,51 @@ class OktaPlugin(ConnectorPlugin):
     # -- CLI ------------------------------------------------------------------
 
     def cli(self) -> typer.Typer:
-        """`lookup-cli okta status <identifier>`.
+        """`lookup-cli okta <identifier> [-s] [-d]`.
 
-        Lives here, not in core `cli.py`, so adding this connector required
-        no edit to `src/lookup_cli/`.
+        Shape: `<service> <person> [what you want]`, with no noun
+        subcommands. `okta status jdoe` and `okta devices jdoe` were removed
+        on 2026-09-02 because they cannot coexist with `okta jdoe` -- a
+        person whose Okta login is literally "status" or "devices" would
+        silently resolve to the subcommand instead of being looked up.
+        Stages 4-6 follow the same shape.
+
+        Lives here, not in core `cli.py`, so this connector required no edit
+        to `src/lookup_cli/`.
         """
-        sub_app = typer.Typer(help="Okta account lookups.")
+        sub_app = typer.Typer(
+            help="Okta account lookups.",
+            # Required: Click groups stop parsing options once they hit a
+            # positional, so without this `okta jdoe -d` fails while
+            # `okta -d jdoe` works -- a confusing split for users.
+            context_settings={"allow_interspersed_args": True},
+        )
         console = Console()
 
-        @sub_app.command("status")
-        def status(
-            identifier: str,
+        @sub_app.callback(invoke_without_command=True)
+        def okta(
+            identifier: str = typer.Argument(..., help="Okta username or email address."),
+            status: bool = typer.Option(
+                False,
+                "--status",
+                "-s",
+                help="Show account status, including whether the user is deactivated. "
+                "This is the default when no other flag is given.",
+            ),
             devices: bool = typer.Option(
                 False,
                 "--devices",
                 "-d",
-                help=(
-                    "Also list devices registered to this user in Okta "
-                    "(Okta Verify / device trust -- not the Jamf or ABM inventory)."
-                ),
+                help="List devices registered to this user in Okta "
+                "(Okta Verify / device trust -- not the Jamf or ABM inventory).",
             ),
         ) -> None:
-            """Show one person's Okta account status."""
-            result = asyncio.run(self.fetch(identifier))
+            """Look one person up in Okta."""
+            # Flags select sections. With none given, status is what people
+            # want; `-d` alone means devices only.
+            show_status = status or not devices
 
+            result = asyncio.run(self.fetch(identifier))
             if not result.ok:
                 console.print(f"[red]Okta lookup failed:[/red] {result.error}")
                 raise typer.Exit(code=1)
@@ -308,29 +352,54 @@ class OktaPlugin(ConnectorPlugin):
                 console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
                 return
 
+            if show_status:
+                _print_status(identifier, result)
+
+            if devices:
+                _print_devices(
+                    identifier,
+                    okta_id=result.properties.get("okta_id"),
+                    # With `-d` alone the devices ARE the answer, so a failure
+                    # is a failed command. Alongside `-s` the status is already
+                    # on screen, so it degrades that one section instead.
+                    primary=not show_status,
+                )
+
+        def _print_status(identifier: str, result: ConnectorResult) -> None:
+            status_value = result.data.get("status") or "UNKNOWN"
+            colour, note = _STATUS_NOTES.get(status_value, ("yellow", ""))
+            changed = (result.properties.get("status_changed") or "")[:10]
+
+            suffix = ""
+            if note:
+                suffix = f" ({note}{' ' + changed if changed else ''})"
+            console.print(
+                f"[bold]{identifier}[/bold] - [{colour}]{status_value}[/{colour}]{suffix}"
+            )
+
             table = Table(title=f"Okta - {identifier}")
             table.add_column("field")
             table.add_column("value")
+            # `found` and `deactivated` are derived and already stated in the
+            # line above; repeating them here is noise.
             for key, value in result.data.items():
-                if key != "found":
+                if key not in ("found", "deactivated"):
                     table.add_row(key, str(value) if value is not None else "-")
             for key, value in result.properties.items():
                 table.add_row(key, str(value) if value is not None else "-")
             console.print(table)
 
-            if devices:
-                # Reuse the id we already resolved rather than looking the
-                # user up a second time.
-                _print_devices(identifier, okta_id=result.properties.get("okta_id"))
-
-        def _print_devices(identifier: str, okta_id: str | None) -> None:
+        def _print_devices(identifier: str, okta_id: str | None, primary: bool) -> None:
             result = asyncio.run(self.fetch_devices(identifier, okta_id=okta_id))
 
             if not result.ok:
-                # The account status above is the primary answer; a device-API
-                # problem degrades that one section rather than failing the
-                # whole command.
                 console.print(f"[red]Devices unavailable:[/red] {result.error}")
+                if primary:
+                    raise typer.Exit(code=1)
+                return
+
+            if not result.data.get("found", True):
+                console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
                 return
 
             found = result.data["devices"]

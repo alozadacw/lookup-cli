@@ -161,6 +161,8 @@ pytest -m okta / jira / jamf / abm / allwhere / cli   # per-stage/plugin
 pytest --cov=src/lookup_cli               # full suite with coverage
 lookup-cli plugins list
 lookup-cli cache path|clear|purge         # local PII cache: inspect / empty
+lookup-cli okta <user>                    # status (default view)
+lookup-cli okta <user> -d                 # devices only;  -sd for both
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
 
@@ -183,8 +185,11 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
   `0700` directory.
 - Stage 2 (Okta): **mocks green** 2026-08-26 — `pytest -m okta` 49 passed.
   `plugins/okta_plugin/` implements the real client; `lookup-cli okta
-  status <user>` and `-d/--devices` both work, and `LOOKUP_CLI_MOCK_OKTA=1`
-  runs either with no credentials. **Outstanding: the manual smoke test
+  <user>` works with `-s/--status` and `-d/--devices` selecting sections
+  (bare = status), and `LOOKUP_CLI_MOCK_OKTA=1` runs any of them with no
+  credentials. **CLI shape is `<service> <identifier> [flags]` for every
+  connector** — no noun subcommands; see the CLI shape note at the top of
+  `docs/STAGES.md` before adding a stage's CLI. **Outstanding: the manual smoke test
   against the real org**, blocked on a real `OKTA_API_TOKEN` in `.env`.
   Note `-d` shows Okta's *device registry* (Okta Verify / device trust),
   not hardware inventory — Jamf/ABM are the authoritative sources and will

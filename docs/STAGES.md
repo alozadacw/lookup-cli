@@ -11,6 +11,29 @@ Suggested labels: `stage:0`..`stage:8`, `plugin:okta`/`jira`/`jamf`/`abm`/`allwh
 
 Legend: **[ ]** not started **[~]** in progress **[x]** done
 
+## CLI shape (decided 2026-09-02 — applies to every connector stage)
+
+```
+lookup-cli <service> <identifier> [flags]
+```
+
+The identifier is a direct argument; flags select which sections to show.
+There are **no noun subcommands** (`okta status jdoe`, `jamf devices jdoe`).
+They cannot coexist with `okta jdoe`: a person whose login is literally
+`status` or `devices` would silently resolve to the subcommand instead of
+being looked up — a wrong answer rather than an error.
+
+- Bare `<service> <identifier>` shows that service's primary view.
+- Flags are additive selectors and bundle (`-sd`).
+- Flags may precede or follow the identifier. This needs
+  `context_settings={"allow_interspersed_args": True}` on the plugin's
+  `typer.Typer`, because Click groups otherwise stop parsing options at the
+  first positional and `<service> jdoe -d` fails while `<service> -d jdoe`
+  works.
+
+Okta (Stage 2) is the reference implementation. Stage 7's aggregate command
+`lookup-cli lookup <identifier>` takes the same shape.
+
 ---
 
 ## Stage 0 -- Plugin Framework
@@ -72,11 +95,12 @@ real token in `.env`).
 | [x] Write mocked-response tests: active, suspended, deprovisioned, not-found, timeout/5xx | Stage 0 |
 | [x] Implement `okta_plugin` package (copy `echo_plugin` template) | tests above |
 | [x] Implement real Okta API client (`GET /api/v1/users/{login}`) behind `_call_backend` | tests above |
-| [x] `lookup-cli okta status <user>` subcommand | plugin implemented |
+| [x] `lookup-cli okta <user>` command (status is the default view) | plugin implemented |
 | [x] Add `OKTA_ORG_URL` / `OKTA_API_TOKEN` to `.env.example` | plugin implemented |
 | [ ] **Confirm a real token works in a manual smoke test** | a real token in `.env` |
 | [x] Add `okta` marker to `pyproject.toml` pytest markers | -- |
-| [x] `okta status <user> -d/--devices` — devices registered to a user | plugin implemented |
+| [x] `-d/--devices` — devices registered to a user | plugin implemented |
+| [x] `-s/--status` — account status, flagging deactivated explicitly | plugin implemented |
 
 Notes from the implementation:
 
@@ -95,11 +119,19 @@ Notes from the implementation:
   CLI can be demoed before a token is provisioned.
 - **`-d` lists devices** via `GET /api/v1/users/{userId}/devices`, kept out of
   `fetch()` deliberately: Stage 7 runs `fetch()` for every plugin on every
-  lookup and must not pay for a second round trip nobody asked for. `status -d`
+  lookup and must not pay for a second round trip nobody asked for. `-sd`
   reuses the id it already resolved, so it costs two calls, not three. Link-header
   pagination is followed, bounded at 20 pages so a looping `next` can't hang.
-  A device-API failure degrades only that section — the account status still
-  prints.
+- **Exit codes depend on what was asked for.** With `-d` alone the devices are
+  the whole answer, so a device-API failure exits 1 and scripts can trust it.
+  With `-sd` the status is already a real answer on screen, so the same failure
+  degrades just that section and exits 0.
+- **`-s` translates the enum.** Okta has eight statuses; "deactivated" in the
+  admin UI means `DEPROVISIONED` specifically, and `SUSPENDED` is a different
+  state that also blocks login. The CLI prints a verdict line
+  (`jdoe - DEPROVISIONED (deactivated 2025-11-02)`) so nobody has to translate
+  in their head, and `data["deactivated"]` carries the boolean for Stage 7 and
+  JSON consumers.
   - **Scope caveat to keep repeating to users:** this is Okta's own device
     registry (Okta Verify / device trust), *not* hardware inventory. Someone can
     hold a laptop Okta has never seen. Jamf (Stage 4) and ABM (Stage 5) are the
@@ -108,7 +140,7 @@ Notes from the implementation:
     should never present Okta's list as "the devices this person has".
 
 **Done when:** `pytest -m okta` green on mocks *(done)*, and one manual
-`lookup-cli okta status <realuser>` against real Okta returns a sane result
+`lookup-cli okta <realuser>` against real Okta returns a sane result
 *(pending)*.
 
 ---
@@ -120,7 +152,7 @@ Notes from the implementation:
 | [ ] Write mocked-response tests: tickets found, zero results, pagination, auth error | Stage 0 |
 | [ ] Implement `jira_plugin` package | tests above |
 | [ ] JQL query `reporter = "<user>"` (confirm: reporter vs. assignee -- decide with team, document choice) | tests above |
-| [ ] `lookup-cli jira tickets <user>` subcommand | plugin implemented |
+| [ ] `lookup-cli jira <user>` command with `-t/--tickets` (see the CLI shape note at the top of this file) | plugin implemented |
 | [ ] Leave room in `properties` for future status/project filters (don't build the filter UI yet, just don't block it) | plugin implemented |
 
 **Done when:** `pytest -m jira` green on mocks, manual smoke test against real Jira confirmed.
@@ -134,7 +166,7 @@ Notes from the implementation:
 | [ ] Write tests against fixture data: devices found, zero devices, malformed fixture | Stage 0 |
 | [ ] Build realistic fixture JSON (device name, serial, model, last check-in, assigned user) | -- |
 | [ ] Implement `jamf_plugin` package with `LOOKUP_CLI_MOCK_JAMF` toggle | tests, fixtures |
-| [ ] `lookup-cli jamf devices <user>` subcommand | plugin implemented |
+| [ ] `lookup-cli jamf <user>` command with `-d/--devices` (see the CLI shape note at the top of this file) | plugin implemented |
 | [ ] **Blocked/parallel track:** once credentials exist, implement real `_call_backend` (Jamf Pro API) -- no test/CLI changes needed | credentials provisioned |
 
 **Done when:** `pytest -m jamf` green against fixtures; real-API swap is a
@@ -150,7 +182,7 @@ separate, low-risk follow-up task once creds land.
 | [ ] Write tests against fixture data: devices found, zero devices | Stage 0 |
 | [ ] Build realistic fixture JSON (device serial, model, enrollment status, MDM server assignment) | -- |
 | [ ] Implement `abm_plugin` package with `LOOKUP_CLI_MOCK_ABM` toggle | tests, fixtures |
-| [ ] `lookup-cli abm devices <user>` subcommand | plugin implemented |
+| [ ] `lookup-cli abm <user>` command with `-d/--devices` (see the CLI shape note at the top of this file) | plugin implemented |
 
 **Done when:** `pytest -m abm` green against fixtures. Flag the auth
 decision above to whoever owns Apple/MDM vendor relationship before
@@ -165,7 +197,7 @@ starting the real-API follow-up.
 | [ ] Write tests against fixture data: shipments found, zero shipments, in-transit vs. delivered states | Stage 0 |
 | [ ] Build realistic fixture JSON | -- |
 | [ ] Implement `allwhere_plugin` package with `LOOKUP_CLI_MOCK_ALLWHERE` toggle | tests, fixtures |
-| [ ] `lookup-cli allwhere shipments <user>` subcommand | plugin implemented |
+| [ ] `lookup-cli allwhere <user>` command with `-s/--shipments` (see the CLI shape note at the top of this file) | plugin implemented |
 
 **Done when:** `pytest -m allwhere` green against fixtures.
 
@@ -243,7 +275,7 @@ the relevant stage can finish, so it doesn't get lost in a task list:
 - [x] ~~Whether CLI subcommands for each plugin live in that plugin's own
       package or stay centralized in `src/lookup_cli/cli.py`~~ **Resolved
       2026-08-25: in the plugin package.** Forced by Stage 2 -- adding
-      `lookup-cli okta status` to core `cli.py` would have broken ground rule
+      `lookup-cli okta` wiring to core `cli.py` would have broken ground rule
       2 for every future connector, and falsified the Stage 8 claim before
       Stage 8 ran. `ConnectorPlugin.cli()` returns an optional `typer.Typer`
       and `build_app()` mounts it under the plugin's name. One generic core
