@@ -61,5 +61,6 @@ markers = [
     "jamf: Stage 4 - Jamf connector",
     "abm: Stage 5 - ABM connector",
     "allwhere: Stage 6 - allwhere connector",
+    "cairo: CAIRO (TPRM) vendor/application connector",
     "cli: Stage 7 - aggregation CLI",
 ]

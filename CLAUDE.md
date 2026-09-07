@@ -90,9 +90,13 @@ Two more things worth knowing:
 
 ## What this project is
 
-A Python CLI (`lookup-cli`) that looks up a person by name/username and
-returns their status/assets across Okta, Jira, Jamf, ABM, and allwhere,
-aggregated into one record. Built plugin-first: every service is a
+A Python CLI (`lookup-cli`) that gathers data about a subject across
+several services and aggregates it into one record. Most connectors are
+person-scoped — Okta, Jira, Jamf, ABM, allwhere all take a username and
+return that person's status/assets. **Not all are:** CAIRO takes a vendor
+or application name. Don't assume `identifier` means "a person" when
+adding a connector (that assumption was baked into the old
+`UnifiedUserRecord` name, renamed 2026-09-04). Built plugin-first: every service is a
 `ConnectorPlugin` discovered via Python entry points, so adding a new
 service never requires touching core code. Full rationale in
 `docs/ARCHITECTURE.md`.
@@ -166,6 +170,7 @@ lookup-cli okta <user> -d                 # devices only;  -sd for both
 lookup-cli okta <user> -a                 # applications;  -apps / --apps
 lookup-cli okta <user> -u                 # authenticators; -authenticators
 lookup-cli okta <user> -sdau              # all four sections
+lookup-cli cairo <name>                   # CAIRO/TPRM vendor + its applications
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
 
@@ -206,7 +211,15 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
   Note `-d` shows Okta's *device registry* (Okta Verify / device trust),
   not hardware inventory — Jamf/ABM are the authoritative sources and will
   legitimately disagree.
-- Whole suite: 310 tests, 98% coverage, single `pytest` run.
+- CAIRO (TPRM vendor/application register): **verified against the live
+  API** 2026-09-04 — `pytest -m cairo` 50 passed, plus a real smoke test of
+  all four paths. First connector confirmed working end-to-end against a
+  real service. **Not person-scoped** — the identifier is a vendor or
+  application name, and it is excluded from the Stage 7 person aggregate by
+  the explicit plugin list documented there. Three separate `status`-ish
+  fields exist on this API and mean different things; see the CAIRO section
+  of `docs/STAGES.md` before touching them.
+- Whole suite: 361 tests, 98% coverage, single `pytest` run.
 - Stages 3-8: not started. Both contract decisions (async `fetch()`,
   injected `PluginConfig`) are resolved and implemented, so Jira (Stage 3)
   is a straight copy of the Okta shape.

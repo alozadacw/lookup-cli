@@ -76,9 +76,9 @@ SQLite table keyed on `(plugin_name, identifier)`. Each row has its own
 - Cache is fully explainable by inspecting one SQLite file --
   deliberately no background eviction daemon or process for v1.
 
-### Aggregation & `UnifiedUserRecord` (`src/lookup_cli/models.py`)
+### Aggregation & `UnifiedRecord` (`src/lookup_cli/models.py`)
 
-`UnifiedUserRecord.from_results(identifier, [result, result, ...])`
+`UnifiedRecord.from_results(identifier, [result, result, ...])`
 merges N `ConnectorResult`s. `.field_for(plugin_name)` returns `None`
 for any plugin that didn't run or errored, rather than raising --
 callers (CLI renderer) are written to expect gaps.

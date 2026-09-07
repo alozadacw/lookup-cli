@@ -157,7 +157,7 @@ async def test_trailing_slash_on_org_url_is_tolerated():
 async def test_user_not_found_is_a_successful_lookup_with_found_false():
     """Design decision (documented in the plugin docstring): "no Okta account"
     is a real answer for an offboarding lookup, not a connector failure. An
-    `error=` would make UnifiedUserRecord.field_for() return None and be
+    `error=` would make UnifiedRecord.field_for() return None and be
     indistinguishable from "Okta was down"."""
     respx.get(f"{USERS_URL}/ghost").mock(return_value=httpx.Response(404))
 

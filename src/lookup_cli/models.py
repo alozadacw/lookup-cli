@@ -2,6 +2,12 @@
 The unified record produced by aggregating every plugin's result for one
 identifier. Deliberately loose on a per-field basis: a missing or
 errored plugin degrades that one field, not the whole record.
+
+The identifier is whatever the queried plugins look up -- a person for
+Okta/Jira/Jamf, an application or vendor for CAIRO. Named `UnifiedRecord`
+rather than `UnifiedUserRecord` (renamed 2026-09-04) precisely because not
+every connector here is person-scoped, and the old name taught the wrong
+mental model to anyone adding one.
 """
 
 from __future__ import annotations
@@ -14,12 +20,12 @@ from lookup_cli.plugins.base import ConnectorResult
 
 
 @dataclass
-class UnifiedUserRecord:
+class UnifiedRecord:
     identifier: str
     results: dict[str, ConnectorResult] = field(default_factory=dict)
 
     @classmethod
-    def from_results(cls, identifier: str, results: list[ConnectorResult]) -> "UnifiedUserRecord":
+    def from_results(cls, identifier: str, results: list[ConnectorResult]) -> "UnifiedRecord":
         return cls(identifier=identifier, results={r.plugin_name: r for r in results})
 
     def field_for(self, plugin_name: str) -> dict[str, Any] | None:

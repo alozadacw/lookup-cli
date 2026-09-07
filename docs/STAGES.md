@@ -97,7 +97,7 @@ no test exercises `Settings` yet (see task below).
 | Task | Depends on | Notes |
 |---|---|---|
 | [x] `Cache` class (SQLite, per plugin+identifier, TTL) | -- | `src/lookup_cli/cache.py` |
-| [x] `UnifiedUserRecord` merge/error model | -- | `src/lookup_cli/models.py` |
+| [x] `UnifiedRecord` merge/error model | -- | `src/lookup_cli/models.py` |
 | [x] `Settings` config loader (env vars / `.env`) | -- | `src/lookup_cli/config.py` |
 | [x] **Run `pytest -m cache` and confirm green** | Cache, model | 8 passed on Python 3.14.0, 2026-08-19 |
 | [x] Write tests for `Settings` config loader | Settings | Done 2026-08-25 -- `tests/unit/config/test_settings.py`, `config.py` 0% -> 100%. Covers defaults, env-var override, `.env` fallback, env-beats-`.env` precedence, `Path` coercion, validation failure, and that unprefixed service creds (`OKTA_*`/`JIRA_*`) are ignored rather than absorbed. Note for future tests: `Settings` reads `.env` relative to **cwd**, so any test touching it must `chdir` to a tmp dir or it silently picks up the repo's real `.env` |
@@ -137,7 +137,7 @@ Notes from the implementation:
   `data={"found": False}` with `ok is True`, not `error=`. The guide asks
   each connector to decide this explicitly: for an offboarding lookup "this
   person has no Okta account" is a real answer, whereas an `error=` makes
-  `UnifiedUserRecord.field_for("okta")` return None -- indistinguishable
+  `UnifiedRecord.field_for("okta")` return None -- indistinguishable
   from "Okta was unreachable".
 - **The identifier is URL-encoded** (`quote(safe="")`). It is user input; an
   email's `@` must keep working while `../` must not walk off
@@ -314,16 +314,108 @@ starting the real-API follow-up.
 
 ---
 
+## CAIRO -- TPRM vendor & application register (real API, credentials available)
+**Status: verified against the live API** 2026-09-04 -- `pytest -m cairo`
+50 passed, and `lookup-cli cairo <name>` was smoke-tested against the real
+dev instance across all four paths (exact match, ambiguous, no match,
+vendor with no assessment). **This is the first connector confirmed working
+end-to-end against a real service.**
+
+Not person-scoped: the identifier is a vendor or application name. Excluded
+from the Stage 7 person aggregate — see the person-scoped plugin list there.
+
+| Task | Depends on |
+|---|---|
+| [x] Write mocked-response tests before implementation | Stage 0 |
+| [x] Implement `cairo_plugin` package (copy `echo_plugin` template) | tests above |
+| [x] Real client behind `_call_vendors_backend` / `_call_vendor_detail_backend` | tests above |
+| [x] `lookup-cli cairo <name>` command | plugin implemented |
+| [x] Add `CAIRO_BASE_URL` / `CAIRO_API_KEY` to `.env.example` | -- |
+| [x] Add `cairo` marker to `pyproject.toml` | -- |
+| [x] **Live smoke test against the real org** | a real key in `.env` |
+| [ ] Point at prod rather than the dev instance | a prod base URL |
+
+Notes from the implementation:
+
+- **The API has no server-side filtering.** `?search=`, `?name=`,
+  `?status=`, `?limit=`, `?page=` are all accepted and all ignored —
+  `/api/vendors` returns the entire register (713 records / ~730KB) every
+  time. Matching is therefore ours to define and happens client-side:
+  case-insensitive substring against `name` and `domain`. This makes the
+  shared cache load-bearing rather than a nicety.
+- **There is no `/api/applications`.** Application detail is nested inside
+  the vendor detail: `GET /api/vendors/{id}` embeds `assessments[]`, each
+  carrying an `engagement_context` describing one application and how it is
+  used. A vendor can have several; 22 of 713 do.
+- **Three fields are called some variant of "status" and none mean the same
+  thing.** On live data they disagree on *every* record:
+
+  | field | values | meaning |
+  |---|---|---|
+  | `vendor.status` | approved / denied / pending_approval / review_required / under_review | **approval — "allowed in our space"** (confirmed with the CAIRO owner) |
+  | `assessment.status` | exempt / pending / pre_complete / post_complete | assessment workflow state |
+  | `assessment.workflow_status` | draft / review_complete / tprm_review / … | review state |
+
+  They are shown under distinct labels and never merged. Collapsing them
+  would give a confident wrong answer to the one question this connector
+  exists to answer.
+- **"No assessment on file" is not "no applications".** 174 of 713 vendors
+  have never been assessed, so the register simply has nothing to say about
+  what they are used for. Rendered as an explicit message, never as an empty
+  applications table.
+- **Ambiguous matches are never auto-resolved.** Several candidates and no
+  exact name match prints a chooser with each candidate's status. An
+  approval answer for the wrong vendor is worse than making someone choose.
+  An exact name still wins, so "Databright" resolves even when "Databright
+  Plugin" also exists.
+- **Personal data is dropped at the shaping step.** The register carries
+  `primary_contact`, `owner`, `assigned_to`, `assigned_to_name` and
+  `coupa_requester_email` for all 713 vendors. Everything in `data` is
+  written to the plaintext local cache, and none of it is needed to answer
+  "is this allowed", so none of it is carried. There are tests asserting it
+  reaches neither `data` nor the terminal.
+- **Descriptions are prose paragraphs and are summarised for the table.**
+  Caught by the live smoke test, not by the mocks: a real description ran to
+  several hundred characters and turned a one-row table into a fifteen-line
+  block. `summarise()` prefers cutting at the first sentence, which on this
+  data is reliably the "what is this" summary.
+- **Adding this connector required zero changes to `src/lookup_cli/`.**
+
+---
+
 ## Stage 7 -- Aggregation & Output
 
 | Task | Depends on |
 |---|---|
-| [ ] `lookup-cli lookup <user>` -- runs every discovered plugin, merges via `UnifiedUserRecord` | Stages 2-6 (or however many are done) |
+| [ ] `lookup-cli lookup <user>` -- runs the **person-scoped plugin list** (see below), merges via `UnifiedRecord` | Stages 2-6 (or however many are done) |
 | [ ] One plugin erroring must not fail the whole command -- test with a deliberately broken mock plugin | above |
 | [ ] `--format table\|json` output flag (default table via `rich`) | above |
 | [ ] Cache integration: check cache before calling `fetch()`, write through after | Stage 1 cache |
 | [ ] Snapshot/golden-file tests for table and JSON output | above |
 | [ ] (Nice-to-have, not required for Stage 7 done-ness) concurrent fetch across plugins | above |
+
+### Person-scoped plugin list (decided 2026-09-04)
+
+`lookup-cli lookup <identifier>` fans out to an **explicit list**, not to
+every discovered plugin:
+
+```
+okta, jira, jamf, abm, allwhere
+```
+
+**CAIRO is deliberately excluded.** It is keyed on a vendor/application
+name, not a person, so `lookup dluo` would search it for *a vendor named
+dluo* and report nothing found — a silent wrong answer in the aggregate
+view, which is the one people trust most.
+
+The exclusion is an explicit list in the aggregate command rather than a
+flag on the plugin (a `person_scoped` / `subjects` attribute on
+`ConnectorPlugin` was the alternative). Chosen because it required **no
+change to core**: adding CAIRO touched only `plugins/cairo_plugin/`, docs,
+and `.env.example`. Trade-off to be aware of: a new person-scoped connector
+must be added to this list by hand, and forgetting means it silently never
+runs in the aggregate. Whoever builds Stage 7 should put a test on the list
+contents so that failure is loud.
 
 **Done when:** `pytest -m cli` green, and `lookup-cli lookup <user>`
 against a mix of real + mocked plugins produces a readable combined result.
@@ -430,6 +522,26 @@ the relevant stage can finish, so it doesn't get lost in a task list:
       but the factor `profile.name` and the device `displayName` are only
       correlatable by string match, which would be a guess. Left unjoined
       deliberately; revisit only if a reliable id links them.
+- [x] ~~How to stop CAIRO being swept into the person aggregate~~
+      **Resolved 2026-09-04:** an explicit person-scoped plugin list in the
+      Stage 7 aggregate command, not a flag on `ConnectorPlugin`. See Stage 7.
+- [x] ~~`UnifiedUserRecord` assumes every lookup is about a person~~
+      **Resolved 2026-09-04:** renamed to `UnifiedRecord`. Done while it had
+      zero callers (Stage 7 unbuilt), which is the cheapest it would ever be.
+      The class was already subject-agnostic — `identifier: str` plus a dict
+      of results — so only the name and docstrings taught the wrong model.
+- [ ] **CAIRO points at a dev instance.** The real host lives in `.env`
+      only -- `.env.example` carries a placeholder, because this repo is
+      public. Switch to prod when a prod host exists; the var is already
+      configurable, so it is a `.env` edit and no code change.
+- [ ] **Duplicate vendor records with conflicting approval status.** The
+      live register was observed holding two records for the same vendor —
+      one `under_review`, one `approved` — i.e. two different answers to "is
+      this allowed". The CLI surfaces both in the chooser rather than picking
+      one, which is the correct behaviour, but it is a data-quality issue
+      worth raising with the CAIRO owners rather than papering over in the
+      client. (Specific vendor names deliberately omitted: this repo is
+      public.)
 - [ ] Which stage marker cross-cutting core utilities belong to.
       `test_redaction.py` was filed under `plugin_framework` because error
       handling is part of the plugin contract in `base.py`, but it is not
