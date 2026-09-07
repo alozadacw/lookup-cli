@@ -8,7 +8,7 @@ Endpoint: `GET {OKTA_ORG_URL}/api/v1/users/{login}` with an
 *successful* result with `data["found"] is False`, not `error=`. The guide
 asks each connector to decide this explicitly: for an offboarding lookup,
 "this person has no Okta account" is a real answer, whereas an `error=`
-would make `UnifiedUserRecord.field_for("okta")` return None and be
+would make `UnifiedRecord.field_for("okta")` return None and be
 indistinguishable from "Okta was unreachable".
 
 **Devices.** `fetch_devices()` (surfaced as `okta <user> -d`) lists the

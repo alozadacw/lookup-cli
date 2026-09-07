@@ -12,7 +12,7 @@ import pytest
 from freezegun import freeze_time
 
 from lookup_cli.cache import Cache
-from lookup_cli.models import UnifiedUserRecord
+from lookup_cli.models import UnifiedRecord
 from lookup_cli.plugins.base import ConnectorResult
 
 pytestmark = pytest.mark.cache
@@ -148,7 +148,7 @@ def test_unified_record_merges_multiple_plugin_results():
     okta_result = _result(plugin="okta", data={"status": "active"})
     jamf_result = _result(plugin="jamf", data={}, error="timeout")
 
-    record = UnifiedUserRecord.from_results("jdoe", [okta_result, jamf_result])
+    record = UnifiedRecord.from_results("jdoe", [okta_result, jamf_result])
 
     assert record.field_for("okta") == {"status": "active"}
     assert record.field_for("jamf") is None  # errored -> degrades gracefully
@@ -156,6 +156,6 @@ def test_unified_record_merges_multiple_plugin_results():
 
 
 def test_unified_record_missing_plugin_returns_none_not_exception():
-    record = UnifiedUserRecord.from_results("jdoe", [])
+    record = UnifiedRecord.from_results("jdoe", [])
     assert record.field_for("okta") is None
     assert record.errors() == {}
