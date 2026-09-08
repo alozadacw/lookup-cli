@@ -316,10 +316,67 @@ Notes from the implementation:
 
 ---
 
-## Stage 3 -- Jira Connector (real API, credentials available)
+## Stage 3 -- Jira Connector (real API, service account)
+**Status: verified against the live instance** 2026-09-07 -- `pytest -m jira`
+61 passed, plus a real smoke test of every path (default, `-r`, `-tr`,
+`--all`, unknown person). Credentials are a **dedicated service account**, not a personal token --
+better than the Okta situation. (Account name omitted: this repo is public.)
 
 | Task | Depends on |
 |---|---|
+| [x] Write mocked-response tests before implementation | Stage 0 |
+| [x] Implement `jira_plugin` package | tests above |
+| [x] JQL query by accountId (**reporter vs assignee resolved -- see below**) | tests above |
+| [x] `lookup-cli jira <user>` with `-t/--tickets` and `-r/--reported` | plugin implemented |
+| [x] `--all` to page the cursor and get a real count | plugin implemented |
+| [x] **Live smoke test against real Jira** | service account in `.env` |
+| [x] Leave room in `properties` for future status/project filters | plugin implemented |
+
+Notes from the implementation -- all three API facts were found by probing
+the live instance, not from documentation:
+
+- **`/rest/api/3/search` is GONE.** It answers `410 Gone` pointing at
+  `/rest/api/3/search/jql`. The original Stage 3 spec was written against
+  it, and most tutorials still show it. There is a test pinning that we
+  never call the removed endpoint.
+- **The new endpoint refuses unbounded JQL** ("Please add a search
+  restriction to your query"), so every query must carry a person filter.
+  Fine here, but it rules out any "show me everything" convenience.
+- **There is no `total`.** Paging is an opaque cursor (`nextPageToken` +
+  `isLast`), and the response carries no count at all. So `count` is only a
+  real count when `complete` is true; otherwise the CLI says **"at least
+  N"**. Reporting a page size as a total would understate someone's
+  workload, which is exactly the quietly-wrong answer this tool exists to
+  catch. `--all` follows the cursor and yields a real number -- live, that
+  was "at least 100" versus an actual **236**.
+- **JQL cannot take a username.** GDPR-era changes removed usernames and
+  emails from JQL, so a lookup is two steps: `/user/search` to get an
+  `accountId`, then query with it. Passing a username matches nothing
+  *without erroring* -- a silent empty answer.
+- **Assignee is the default; reporter is `-r`.** Decided 2026-09-07 with
+  real numbers in hand: for the same person the live instance returned 29
+  reported versus 236 assigned. Assigned is the actionable set -- open work
+  that needs reassigning when someone leaves, or that says what someone is
+  stuck on. Reported is historical. They are shown under separate headings
+  and never merged into one count.
+- **Several matching accounts is ambiguity, not a guess.** Picking the
+  first would attribute someone else's tickets to the person asked about.
+  A chooser is printed, same shape as `okta --find` and `cairo`.
+- **Inactive accounts are resolved, not skipped.** A deactivated Jira user
+  is exactly who an offboarding check is asking about.
+- **Only rendered fields are requested** (`fields=key,summary,status,...`).
+  Jira issues carry description bodies, comments and custom fields, and
+  everything in `data` reaches the plaintext local cache.
+- **Two bugs the mocks could not catch, both found live:**
+  - Mock mode returned raw fixtures without passing them through
+    `_to_issue`, so it exercised a different shape than the real path.
+  - `--all` fetched 236 issues, rendered 15, and advised "use `--all`" --
+    the flag already in use. Display policy was being inferred from whether
+    the *fetch* was complete, which is a different question from what the
+    user asked to see. Same dead-end class as the earlier "narrow the
+    search" wording in `okta --find`; worth watching for a third time.
+
+---|---|
 | [ ] Write mocked-response tests: tickets found, zero results, pagination, auth error | Stage 0 |
 | [ ] Implement `jira_plugin` package | tests above |
 | [ ] JQL query `reporter = "<user>"` (confirm: reporter vs. assignee -- decide with team, document choice) | tests above |
