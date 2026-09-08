@@ -1075,6 +1075,90 @@ def test_find_with_no_matches_says_so():
     assert "no" in _out(result).lower()
 
 
+# --- --all : show everything, not just the first page ---------------------------
+
+
+def _many(n):
+    return [_found_user(f"dperson{i:03d}", "D", f"Person{i}", uid=f"00u{i}") for i in range(n)]
+
+
+@respx.mock
+def test_without_all_the_display_is_capped():
+    from okta_plugin.plugin import MAX_MATCHES_SHOWN
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d"]))
+
+    assert "47 people match" in out
+    assert f"dperson{MAX_MATCHES_SHOWN - 1:03d}" in out
+    assert f"dperson{MAX_MATCHES_SHOWN:03d}" not in out
+
+
+@respx.mock
+def test_the_cap_message_names_the_escape_hatch():
+    """Telling someone to narrow without mentioning --all repeats the dead
+    end that the --find hint exists to prevent."""
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d"]))
+
+    assert "32 more not shown" in out
+    assert "--all" in out
+
+
+@respx.mock
+def test_all_shows_every_match():
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d", "--all"]))
+
+    assert "dperson000" in out
+    assert "dperson046" in out
+    assert "more not shown" not in out
+
+
+@respx.mock
+def test_all_works_before_or_after_the_query():
+    _mock_search(*_many(20))
+    a = _out(runner.invoke(_app(), ["okta", "--find", "d", "--all"]))
+    _mock_search(*_many(20))
+    b = _out(runner.invoke(_app(), ["okta", "--all", "--find", "d"]))
+
+    assert "dperson019" in a
+    assert "dperson019" in b
+
+
+def test_all_without_find_is_a_usage_error():
+    """--all modifies the search; there is no search to modify. Accepting it
+    silently would leave someone believing they had asked for something."""
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "--all"])
+
+    assert result.exit_code == 2
+    assert "--all" in _out(result)
+
+
+def test_all_combined_with_a_section_flag_is_a_usage_error():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "--all", "-d"])
+
+    assert result.exit_code == 2
+
+
+def test_all_has_no_short_flag():
+    """`-a` already means apps. A short --all would be genuinely ambiguous."""
+    assert runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "--find", "-all"]).exit_code == 2
+
+
+@respx.mock
+def test_multi_token_search_narrows_from_the_cli():
+    """The advice the cap message gives has to actually work."""
+    route = _mock_search(_found_user("dluo", "Dennis", "Luo"))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "dennis luo"]))
+
+    assert "dluo" in out
+    assert " and " in route.calls.last.request.url.params["search"]
+
+
 # --- Not chainable -----------------------------------------------------------
 
 

@@ -129,6 +129,14 @@ MAX_MATCHES_SHOWN = 15
 def build_search_expression(query: str) -> str:
     """Okta `search` expression matching `query` against the name fields.
 
+    **Whitespace splits into AND-ed groups.** Each token must match *some*
+    field, so "dennis luo" is `(any field starts with dennis) and (any field
+    starts with luo)` -- which also means token order doesn't matter, and
+    nobody has to know whether the directory stores "Dennis Luo" or "Luo,
+    Dennis". Treating the whole string as one term instead made a full-name
+    search match nobody, which was doubly bad because adding a surname is
+    exactly the advice the "too many matches" message gives.
+
     **No status clause, deliberately.** Okta's List Users endpoint excludes
     `DEPROVISIONED` users by default, and any status predicate added here
     risks reproducing that exclusion. For a tool whose central question is
@@ -139,12 +147,22 @@ def build_search_expression(query: str) -> str:
     docs/STAGES.md for the live smoke test, and if it does, the fix is an
     explicit all-statuses clause added here.
     """
-    cleaned = " ".join((query or "").split())
-    if not cleaned:
+    tokens = (query or "").split()
+    if not tokens:
         raise ValueError("--find needs a name to search for.")
-    # Escape quotes and backslashes so a name can't terminate the filter string.
-    safe = cleaned.replace("\\", "\\\\").replace('"', '\\"')
-    return " or ".join(f'{field} sw "{safe}"' for field in _SEARCH_FIELDS)
+
+    groups = []
+    for token in tokens:
+        # Escape backslashes then quotes, so a name can't terminate the
+        # filter string or smuggle an operator into it.
+        safe = token.replace("\\", "\\\\").replace('"', '\\"')
+        groups.append(" or ".join(f'{field} sw "{safe}"' for field in _SEARCH_FIELDS))
+
+    if len(groups) == 1:
+        return groups[0]
+    # Parenthesised: `a or b and c or d` binds wrongly and the AND would
+    # silently stop narrowing.
+    return " and ".join(f"({group})" for group in groups)
 
 
 def parse_since(raw: str) -> timedelta:
@@ -409,7 +427,7 @@ class OktaPlugin(ConnectorPlugin):
             tags=["no-authenticators"] if not factors else ["has-authenticators"],
         )
 
-    async def fetch_search(self, query: str) -> ConnectorResult:
+    async def fetch_search(self, query: str, *, fetch_all: bool = False) -> ConnectorResult:
         """Find users whose name, login or email starts with `query`.
 
         Returns candidates and never picks one: a single hit is not the same
@@ -419,7 +437,7 @@ class OktaPlugin(ConnectorPlugin):
         """
         try:
             expression = build_search_expression(query)
-            raw_users = await self._call_search_backend(expression)
+            raw_users, truncated = await self._call_search_backend(expression, fetch_all)
         except ValueError as exc:
             # Bad input, not a service failure -- but still an error result
             # rather than an exception, per the connector contract.
@@ -441,9 +459,11 @@ class OktaPlugin(ConnectorPlugin):
             data={
                 "matches": matches,
                 "count": len(matches),
-                # A full page back means Okta may be holding more. Saying
-                # nothing would let a capped list read as "that is everyone".
-                "truncated": len(raw_users) >= MAX_SEARCH_RESULTS,
+                # Without --all: a full page back means Okta may be holding
+                # more. With --all: we ran out of page budget while a `next`
+                # link still existed. Either way the answer is incomplete, and
+                # saying nothing would let it read as "that is everyone".
+                "truncated": truncated,
                 # Read by Stage 7's cache integration. A cached hit could
                 # report someone ACTIVE minutes after they were deactivated --
                 # wrong in exactly the case that matters.
@@ -622,33 +642,75 @@ class OktaPlugin(ConnectorPlugin):
             ),
         )
 
-    async def _call_search_backend(self, expression: str) -> list[dict]:
+    async def _call_search_backend(
+        self, expression: str, fetch_all: bool = False
+    ) -> tuple[list[dict], bool]:
+        """Return (users, truncated).
+
+        One page by default: search is interactive, not an audit, and paging
+        thousands of users to render a 15-row table would burn rate-limit
+        budget nobody asked to spend. `--all` opts into the extra requests.
+        """
         if self.mock_mode:
-            return self._mock_search_fixture()
+            return self._mock_search_fixture(), False
 
         org_url = self.config.require("OKTA_ORG_URL").rstrip("/")
-        params = {"search": expression, "limit": str(MAX_SEARCH_RESULTS)}
+        url = f"{org_url}/api/v1/users"
+        params: dict[str, str] | None = {
+            "search": expression,
+            "limit": str(MAX_SEARCH_RESULTS),
+        }
+
+        users: list[dict] = []
+        seen_urls: set[str] = set()
+        pages = _MAX_PAGES if fetch_all else 1
+        truncated = False
 
         async with self._client() as client:
-            response = await client.get(
-                f"{org_url}/api/v1/users", headers=self._headers(), params=params
-            )
+            for _ in range(pages):
+                if url in seen_urls:
+                    # Self-referential `next`: stop rather than loop. We were
+                    # told more exists but can't safely reach it, so this is
+                    # an incomplete answer, not a finished one.
+                    truncated = True
+                    break
+                seen_urls.add(url)
 
-        if response.status_code in (401, 403):
-            raise RuntimeError(
-                "Okta refused the user search. This API token may lack user read "
-                "access across the directory, which is broader than reading a "
-                "single known user."
-            )
-        if response.status_code == 400:
-            # Okta answers 400 for a filter it can't parse. Its raw body is not
-            # actionable, and the expression is ours, so name that.
-            raise RuntimeError(
-                "Okta rejected the search expression. This is a bug in how the "
-                "search filter is built, not something a different name will fix."
-            )
-        response.raise_for_status()
-        return response.json()
+                response = await client.get(url, headers=self._headers(), params=params)
+                params = None  # the `next` URL already carries the query
+
+                if response.status_code in (401, 403):
+                    raise RuntimeError(
+                        "Okta refused the user search. This API token may lack user "
+                        "read access across the directory, which is broader than "
+                        "reading a single known user."
+                    )
+                if response.status_code == 400:
+                    # Okta answers 400 for a filter it can't parse. Its raw body
+                    # is not actionable, and the expression is ours, so name that.
+                    raise RuntimeError(
+                        "Okta rejected the search expression. This is a bug in how "
+                        "the search filter is built, not something a different name "
+                        "will fix."
+                    )
+                response.raise_for_status()
+
+                page = response.json()
+                users.extend(page)
+
+                next_url = response.links.get("next", {}).get("url")
+                if not next_url:
+                    break
+                url = next_url
+            else:
+                # Ran out of page budget with a `next` still outstanding. A
+                # hard bound keeps a looping `next` from hanging the CLI, but
+                # the answer is incomplete and must say so.
+                truncated = True
+
+        if not fetch_all:
+            truncated = len(users) >= MAX_SEARCH_RESULTS
+        return users, truncated
 
     async def _call_apps_backend(self, okta_id: str) -> list[dict]:
         if self.mock_mode:
@@ -961,6 +1023,13 @@ class OktaPlugin(ConnectorPlugin):
                 "username. Long-only and cannot be combined with the section "
                 "flags -- it finds a person, it does not describe one.",
             ),
+            show_all: bool = typer.Option(
+                False,
+                "--all",
+                help="With --find, show every match instead of the first "
+                "screenful, following pagination. Long-only: -a already means "
+                "applications.",
+            ),
             last_signin: bool = typer.Option(
                 False,
                 "--last-signin",
@@ -999,8 +1068,18 @@ class OktaPlugin(ConnectorPlugin):
                         f"{conflicting[0]}[/bold]"
                     )
                     raise typer.Exit(code=2)
-                _print_search(identifier)
+                _print_search(identifier, fetch_all=show_all)
                 return
+
+            if show_all:
+                # --all modifies the search; there is no search to modify.
+                # Accepting it silently would leave someone believing they
+                # had asked for something.
+                console.print(
+                    "[red]--all only applies to --find.[/red]\n"
+                    f"Did you mean: [bold]lookup-cli okta --find {identifier} --all[/bold]?"
+                )
+                raise typer.Exit(code=2)
 
             # Asking for per-device sign-ins obviously means you want the
             # device table; requiring -d as well would just be pedantry.
@@ -1056,7 +1135,7 @@ class OktaPlugin(ConnectorPlugin):
             if authenticators:
                 _print_authenticators(identifier, okta_id=okta_id, primary=sole_section)
 
-        def _print_search(query: str) -> None:
+        def _print_search(query: str, fetch_all: bool = False) -> None:
             """Candidate chooser for `--find`.
 
             Deliberately the same shape as the CAIRO connector's vendor
@@ -1067,7 +1146,7 @@ class OktaPlugin(ConnectorPlugin):
             core is a bigger decision than a connector task should make, and
             is logged in docs/STAGES.md instead.
             """
-            result = asyncio.run(self.fetch_search(query))
+            result = asyncio.run(self.fetch_search(query, fetch_all=fetch_all))
 
             if not result.ok:
                 console.print(f"[red]Okta search failed:[/red] {result.error}")
@@ -1077,12 +1156,13 @@ class OktaPlugin(ConnectorPlugin):
             if not matches:
                 console.print(f"[yellow]No Okta user matches[/yellow] {query}")
                 console.print(
-                    "[dim]Search matches the start of a first name, surname, login "
-                    "or email -- so 'dennis' finds Dennis, but 'ennis' finds nobody.[/dim]"
+                    "[dim]Search matches the start of a first name, surname, login or "
+                    "email -- so 'dennis' finds Dennis, but 'ennis' finds nobody. "
+                    "Multiple words narrow: 'dennis luo' needs both to match.[/dim]"
                 )
                 return
 
-            shown = matches[:MAX_MATCHES_SHOWN]
+            shown = matches if fetch_all else matches[:MAX_MATCHES_SHOWN]
             console.print(
                 f"[yellow]{result.data['count']} "
                 f"{'person' if result.data['count'] == 1 else 'people'} match[/yellow] "
@@ -1108,15 +1188,20 @@ class OktaPlugin(ConnectorPlugin):
             console.print(table)
 
             if len(matches) > len(shown):
-                # Never truncate silently -- a short list reads as "that's all".
+                # Never truncate silently -- a short list reads as "that's all"
+                # -- and always name the way out. Telling someone to narrow
+                # without mentioning --all repeats the dead end that the
+                # --find hint exists to prevent.
                 console.print(
                     f"[yellow]{len(matches) - len(shown)} more not shown[/yellow] - "
-                    "narrow the search."
+                    "narrow the search (try adding a surname), or use [bold]--all[/bold]"
                 )
             if result.data["truncated"]:
                 console.print(
                     "[yellow]Okta may be holding more matches than it returned[/yellow] - "
-                    "narrow the search to be sure you are seeing everyone."
+                    + ("narrow the search to be sure you are seeing everyone."
+                       if fetch_all else
+                       "narrow the search, or use [bold]--all[/bold] to follow pagination.")
                 )
 
             # Make the two-step flow copy-paste rather than retype.

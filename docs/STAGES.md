@@ -139,6 +139,7 @@ real token in `.env`) and is now the **only** unchecked task in this stage.
 | [x] `-a`/`-apps`/`--apps` — applications assigned to a user (`/appLinks`) | plugin implemented |
 | [x] `-u`/`-authenticators`/`--authenticators` — enrolled authenticators (`/factors`) | plugin implemented |
 | [x] `--find` — resolve a partial name to a username (long-only, not chainable) | plugin implemented |
+| [x] `--find` multi-token narrowing + `--all` to see past the display cap | `--find` |
 | [ ] **Verify `--find` returns DEPROVISIONED users against the real org** | a real token in `.env` |
 
 Notes from the implementation:
@@ -226,7 +227,24 @@ Notes from the implementation:
     behaviour that mocks cannot prove*. **Check this in the live smoke test.**
     If deactivated users are missing, the fix is an explicit all-statuses
     clause in `build_search_expression()` — one function, one test.
-  - **One request, no pagination following.** Search is interactive, not an
+  - **Whitespace splits the query into AND-ed groups.** `--find "dennis luo"`
+    requires both tokens to match some field, so token order doesn't matter.
+    Before this it matched *nobody*: the whole string became one `startsWith`
+    term and no first name begins "dennis luo". That was doubly bad, because
+    adding a surname is exactly the advice the "too many matches" message
+    gives — the documented escape hatch was the one thing guaranteed to fail.
+  - **Two different truncations, one flag.** The display cap
+    (`MAX_MATCHES_SHOWN`, 15) hides rows already in memory and costs nothing
+    to lift. The API cap (`MAX_SEARCH_RESULTS`, 200) is a page boundary and
+    needs real requests to pass. `--all` lifts both: it prints every match
+    and follows `Link: rel="next"` up to `_MAX_PAGES`. Long-only, because
+    `-a` already means applications and a short `--all` would be genuinely
+    ambiguous. `--all` outside `--find` is a usage error, not a no-op.
+  - **Both truncation messages name the escape hatch.** An earlier version
+    said only "narrow the search", which repeated the dead end the `--find`
+    hint exists to prevent: it told you a way out existed without saying what
+    it was.
+  - **One request by default, no pagination following.** Search is interactive, not an
     audit; paging thousands of users to render a 15-row table would burn
     rate-limit budget. A full page back sets `truncated`, which the CLI
     reports rather than passing a capped list off as complete.

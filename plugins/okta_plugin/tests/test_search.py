@@ -104,6 +104,57 @@ def test_a_blank_query_is_rejected(blank):
         build_search_expression(blank)
 
 
+# --- Multi-token queries ------------------------------------------------------
+
+
+def test_a_single_token_query_is_a_plain_or_group():
+    expr = build_search_expression("dennis")
+
+    assert " and " not in expr
+    assert expr.count(" or ") == 3
+
+
+def test_a_full_name_ands_the_tokens_together():
+    """Before this, `--find "dennis luo"` matched nobody: the whole string
+    became one startsWith term and no first name begins "dennis luo". The
+    most natural way to narrow a search was the one guaranteed to fail."""
+    expr = build_search_expression("dennis luo")
+
+    assert " and " in expr
+    assert 'sw "dennis"' in expr
+    assert 'sw "luo"' in expr
+    assert 'sw "dennis luo"' not in expr
+
+
+def test_each_token_is_ored_across_every_field():
+    """So "luo dennis" works as well as "dennis luo" -- nobody should have to
+    know which order the directory stores names in."""
+    expr = build_search_expression("dennis luo")
+
+    for token in ("dennis", "luo"):
+        for field in ("profile.firstName", "profile.lastName"):
+            assert f'{field} sw "{token}"' in expr
+
+
+def test_token_groups_are_parenthesised():
+    """Without parentheses, `a or b and c or d` binds wrongly and the AND
+    silently stops narrowing anything."""
+    expr = build_search_expression("dennis luo")
+
+    assert expr.startswith("(")
+    assert ") and (" in expr
+
+
+def test_repeated_whitespace_between_tokens_is_collapsed():
+    assert build_search_expression("dennis   luo") == build_search_expression("dennis luo")
+
+
+def test_three_tokens_all_narrow():
+    expr = build_search_expression("mary jane watson")
+
+    assert expr.count(") and (") == 2
+
+
 # --- Results -----------------------------------------------------------------
 
 
@@ -283,6 +334,66 @@ async def test_a_partial_page_is_not_truncated():
     respx.get(USERS_URL).mock(return_value=httpx.Response(200, json=[_user()]))
 
     result = await _plugin().fetch_search("dennis")
+
+    assert result.data["truncated"] is False
+
+
+# --- --all : fetch beyond the first page --------------------------------------
+
+
+@respx.mock
+async def test_all_follows_pagination():
+    """Without --all a single page is the answer; with it, the caller has
+    explicitly asked to pay for more requests."""
+    page_two = f"{USERS_URL}?after=cursor2"
+    respx.get(USERS_URL, params={"after": "cursor2"}).mock(
+        return_value=httpx.Response(200, json=[_user("zwu", "Zoe", "Wu", uid="00u9")])
+    )
+    first = respx.get(USERS_URL).mock(
+        return_value=httpx.Response(
+            200, json=[_user()], headers={"Link": f'<{page_two}>; rel="next"'}
+        )
+    )
+
+    result = await _plugin().fetch_search("d", fetch_all=True)
+
+    assert first.call_count == 1
+    assert {m["login"] for m in result.data["matches"]} == {"dluo", "zwu"}
+
+
+@respx.mock
+async def test_without_all_a_next_link_is_ignored():
+    route = respx.get(USERS_URL).mock(
+        return_value=httpx.Response(
+            200, json=[_user()], headers={"Link": f'<{USERS_URL}?after=x>; rel="next"'}
+        )
+    )
+
+    await _plugin().fetch_search("d")
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_all_still_reports_truncation_if_it_runs_out_of_pages():
+    """A hard page bound still exists so a looping `next` cannot hang the
+    CLI. Hitting it is still an incomplete answer and must say so."""
+    respx.get(USERS_URL).mock(
+        return_value=httpx.Response(
+            200, json=[_user()], headers={"Link": f'<{USERS_URL}?after=loop>; rel="next"'}
+        )
+    )
+
+    result = await _plugin().fetch_search("d", fetch_all=True)
+
+    assert result.data["truncated"] is True
+
+
+@respx.mock
+async def test_all_that_reaches_the_end_is_not_truncated():
+    respx.get(USERS_URL).mock(return_value=httpx.Response(200, json=[_user()]))
+
+    result = await _plugin().fetch_search("d", fetch_all=True)
 
     assert result.data["truncated"] is False
 
