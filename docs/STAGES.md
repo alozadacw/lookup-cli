@@ -41,6 +41,14 @@ multi-character single-dash form, and a long form — e.g. apps is
 The single-character form is what makes bundling work; the longer forms are
 what make a script readable. Both are wanted, so both are declared.
 
+There is a **third category**, added 2026-09-07: a *mode* flag, which is
+long-only and composes with nothing. `--find` is the first. Short flags
+select sections and compose (`-sdau`); a mode flag replaces the whole
+operation, so it gets no short form — that removes every bundled spelling
+(`-sdf`, `-fd`) at the parser level for free, since an undeclared `-f` makes
+the bundle unparseable. The remaining case (`--find -d`) has to be caught at
+runtime; Click has no parser-level mutual exclusion.
+
 Two consequences to know before adding a stage's flags:
 
 - **A multi-character single-dash flag cannot appear inside a bundle.**
@@ -130,6 +138,9 @@ real token in `.env`) and is now the **only** unchecked task in this stage.
 | [x] `--last-signin` — per-device last sign-in, opt-in, with `--since` | devices |
 | [x] `-a`/`-apps`/`--apps` — applications assigned to a user (`/appLinks`) | plugin implemented |
 | [x] `-u`/`-authenticators`/`--authenticators` — enrolled authenticators (`/factors`) | plugin implemented |
+| [x] `--find` — resolve a partial name to a username (long-only, not chainable) | plugin implemented |
+| [x] `--find` multi-token narrowing + `--all` to see past the display cap | `--find` |
+| [ ] **Verify `--find` returns DEPROVISIONED users against the real org** | a real token in `.env` |
 
 Notes from the implementation:
 
@@ -200,6 +211,55 @@ Notes from the implementation:
   - **Unverified against a real org.** Whether events populate `device.id`
     depends on Identity Engine and Okta Verify enrolment. If they do not, the
     column is honestly empty — worth confirming in the live smoke test.
+- **`--find` is a mode, not a section.** Section flags answer "what do you
+  want to see about this person"; `--find` answers "who is this person". There
+  is nothing to describe until one has been picked, so combining them is a
+  usage error (exit 2) with the two-step command printed, rather than silently
+  dropping the section the user typed. Long-only by design — see the third
+  flag category at the top of this file.
+  - **⚠️ Unverified and load-bearing: Okta's List Users endpoint excludes
+    `DEPROVISIONED` users by default.** For a tool whose central question is
+    "did this person's access actually get revoked", a search that silently
+    omits the deactivated person is worse than no search — it looks complete.
+    `build_search_expression()` therefore sends **no status clause at all**,
+    and there is a test pinning that the client never filters by status. But
+    whether `search=` itself inherits the endpoint default is *server-side
+    behaviour that mocks cannot prove*. **Check this in the live smoke test.**
+    If deactivated users are missing, the fix is an explicit all-statuses
+    clause in `build_search_expression()` — one function, one test.
+  - **Whitespace splits the query into AND-ed groups.** `--find "dennis luo"`
+    requires both tokens to match some field, so token order doesn't matter.
+    Before this it matched *nobody*: the whole string became one `startsWith`
+    term and no first name begins "dennis luo". That was doubly bad, because
+    adding a surname is exactly the advice the "too many matches" message
+    gives — the documented escape hatch was the one thing guaranteed to fail.
+  - **Two different truncations, one flag.** The display cap
+    (`MAX_MATCHES_SHOWN`, 15) hides rows already in memory and costs nothing
+    to lift. The API cap (`MAX_SEARCH_RESULTS`, 200) is a page boundary and
+    needs real requests to pass. `--all` lifts both: it prints every match
+    and follows `Link: rel="next"` up to `_MAX_PAGES`. Long-only, because
+    `-a` already means applications and a short `--all` would be genuinely
+    ambiguous. `--all` outside `--find` is a usage error, not a no-op.
+  - **Both truncation messages name the escape hatch.** An earlier version
+    said only "narrow the search", which repeated the dead end the `--find`
+    hint exists to prevent: it told you a way out existed without saying what
+    it was.
+  - **One request by default, no pagination following.** Search is interactive, not an
+    audit; paging thousands of users to render a 15-row table would burn
+    rate-limit budget. A full page back sets `truncated`, which the CLI
+    reports rather than passing a capped list off as complete.
+  - **Never auto-resolves, even on a single match.** One candidate is not the
+    same claim as the right person, and the section flags act on whoever is
+    named next.
+  - **Results are never cached** (`data["cacheable"] is False`). A cached hit
+    could report someone `ACTIVE` minutes after they were deactivated — wrong
+    in exactly the case that matters. Stage 7's cache integration must honour
+    that flag.
+  - **The discoverability hint is not a fallback.** A failed exact lookup
+    prints `Try: lookup-cli okta --find <name>` but does *not* run a search —
+    `--find` stays explicit and the miss path stays one API call. Not knowing
+    the username is exactly the situation in which you also would not know
+    the flag exists.
 - **Flag convention:** short flags are section selectors (`-s`, `-d`, `-a`,
   `-u`); long-only flags modify how a section renders (`--last-signin`,
   `--since`). Keeps `-sdau` meaning "four sections" and leaves `-g`/`-l` free
@@ -542,6 +602,17 @@ the relevant stage can finish, so it doesn't get lost in a task list:
       worth raising with the CAIRO owners rather than papering over in the
       client. (Specific vendor names deliberately omitted: this repo is
       public.)
+- [ ] **The candidate chooser is now implemented twice.** `okta --find` and
+      `cairo <name>` solve the same problem (fuzzy input, several candidates,
+      never guess) and render the same shape: a table with each candidate's
+      status, exact-match-wins, a cap with "N more not shown", and no
+      auto-resolution on a single hit. They are deliberately duplicated
+      because `plugins/CLAUDE.md` forbids importing across plugin packages,
+      and extracting shared rendering into `src/lookup_cli/` is a core
+      decision that a connector task should not make as a side effect. If a
+      third connector needs it, that is the signal to extract — a
+      `lookup_cli.chooser` helper taking rows plus column labels. Two copies
+      is cheaper than the wrong abstraction; three is not.
 - [ ] Which stage marker cross-cutting core utilities belong to.
       `test_redaction.py` was filed under `plugin_framework` because error
       handling is part of the plugin contract in `base.py`, but it is not

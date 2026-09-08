@@ -38,6 +38,14 @@ useful fact, while the question itself is a recovery-credential hint with
 no operational value here. Phone numbers and emails are shown exactly as
 Okta returns them, which is already partially masked for SMS.
 
+**Name search.** `fetch_search()` (`okta --find <name>`) resolves a partial
+name to a username via `GET /api/v1/users?search=...`, for when someone
+knows a colleague's first or surname but not their login. `--find` is
+long-only and composes with nothing: short flags here are section
+selectors, and search is not a section -- it answers "who is this person",
+not "what do you want to see about them". Results are never cached, and no
+status filter is sent (see `build_search_expression`).
+
 Required env vars (see `.env.example`):
     OKTA_ORG_URL        e.g. https://acme.okta.com
     OKTA_API_TOKEN      an SSWS token
@@ -101,6 +109,60 @@ MAX_LOG_WINDOW = timedelta(days=90)
 _SIGNIN_EVENT_TYPES = ("user.session.start", "user.authentication.sso")
 
 _SINCE_RE = re.compile(r"^\s*(\d+)\s*([dh])\s*$", re.IGNORECASE)
+
+#: Profile fields a searcher might plausibly know. `sw` (startsWith) is what
+#: Okta's `search` supports broadly; it means "dennis" finds Dennis but "enn"
+#: finds nobody, which is an acceptable trade for covering "I know their first
+#: or surname".
+_SEARCH_FIELDS = ("profile.firstName", "profile.lastName", "profile.login", "profile.email")
+
+#: One page, requested once. Search is interactive, not an audit -- following
+#: Link headers to page thousands of users to render a 15-row table would burn
+#: rate-limit budget for nothing. A full page back is reported as truncated
+#: rather than passed off as the complete answer.
+MAX_SEARCH_RESULTS = 200
+
+#: Rows the chooser prints before it starts saying "N more".
+MAX_MATCHES_SHOWN = 15
+
+
+def build_search_expression(query: str) -> str:
+    """Okta `search` expression matching `query` against the name fields.
+
+    **Whitespace splits into AND-ed groups.** Each token must match *some*
+    field, so "dennis luo" is `(any field starts with dennis) and (any field
+    starts with luo)` -- which also means token order doesn't matter, and
+    nobody has to know whether the directory stores "Dennis Luo" or "Luo,
+    Dennis". Treating the whole string as one term instead made a full-name
+    search match nobody, which was doubly bad because adding a surname is
+    exactly the advice the "too many matches" message gives.
+
+    **No status clause, deliberately.** Okta's List Users endpoint excludes
+    `DEPROVISIONED` users by default, and any status predicate added here
+    risks reproducing that exclusion. For a tool whose central question is
+    "did this person's access actually get revoked", a search that silently
+    omits the deactivated person is worse than no search -- it looks
+    complete. Whether `search=` itself inherits the default exclusion is
+    server-side behaviour that mocks cannot prove; it is flagged in
+    docs/STAGES.md for the live smoke test, and if it does, the fix is an
+    explicit all-statuses clause added here.
+    """
+    tokens = (query or "").split()
+    if not tokens:
+        raise ValueError("--find needs a name to search for.")
+
+    groups = []
+    for token in tokens:
+        # Escape backslashes then quotes, so a name can't terminate the
+        # filter string or smuggle an operator into it.
+        safe = token.replace("\\", "\\\\").replace('"', '\\"')
+        groups.append(" or ".join(f'{field} sw "{safe}"' for field in _SEARCH_FIELDS))
+
+    if len(groups) == 1:
+        return groups[0]
+    # Parenthesised: `a or b and c or d` binds wrongly and the AND would
+    # silently stop narrowing.
+    return " and ".join(f"({group})" for group in groups)
 
 
 def parse_since(raw: str) -> timedelta:
@@ -365,6 +427,51 @@ class OktaPlugin(ConnectorPlugin):
             tags=["no-authenticators"] if not factors else ["has-authenticators"],
         )
 
+    async def fetch_search(self, query: str, *, fetch_all: bool = False) -> ConnectorResult:
+        """Find users whose name, login or email starts with `query`.
+
+        Returns candidates and never picks one: a single hit is not the same
+        claim as the right person, and the section flags act on whoever the
+        operator names next. Like `fetch()`, never raises for ordinary
+        failures.
+        """
+        try:
+            expression = build_search_expression(query)
+            raw_users, truncated = await self._call_search_backend(expression, fetch_all)
+        except ValueError as exc:
+            # Bad input, not a service failure -- but still an error result
+            # rather than an exception, per the connector contract.
+            return ConnectorResult(plugin_name=self.name, identifier=query, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=query,
+                error=safe_error(exc, secrets=[self.config.get("OKTA_API_TOKEN")]),
+            )
+
+        matches = sorted(
+            (self._to_match(user) for user in raw_users),
+            key=lambda m: (m["login"] or "").lower(),
+        )
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=query,
+            data={
+                "matches": matches,
+                "count": len(matches),
+                # Without --all: a full page back means Okta may be holding
+                # more. With --all: we ran out of page budget while a `next`
+                # link still existed. Either way the answer is incomplete, and
+                # saying nothing would let it read as "that is everyone".
+                "truncated": truncated,
+                # Read by Stage 7's cache integration. A cached hit could
+                # report someone ACTIVE minutes after they were deactivated --
+                # wrong in exactly the case that matters.
+                "cacheable": False,
+            },
+            tags=["no-matches"] if not matches else ["has-matches"],
+        )
+
     async def fetch_device_signins(
         self,
         okta_id: str,
@@ -535,6 +642,76 @@ class OktaPlugin(ConnectorPlugin):
             ),
         )
 
+    async def _call_search_backend(
+        self, expression: str, fetch_all: bool = False
+    ) -> tuple[list[dict], bool]:
+        """Return (users, truncated).
+
+        One page by default: search is interactive, not an audit, and paging
+        thousands of users to render a 15-row table would burn rate-limit
+        budget nobody asked to spend. `--all` opts into the extra requests.
+        """
+        if self.mock_mode:
+            return self._mock_search_fixture(), False
+
+        org_url = self.config.require("OKTA_ORG_URL").rstrip("/")
+        url = f"{org_url}/api/v1/users"
+        params: dict[str, str] | None = {
+            "search": expression,
+            "limit": str(MAX_SEARCH_RESULTS),
+        }
+
+        users: list[dict] = []
+        seen_urls: set[str] = set()
+        pages = _MAX_PAGES if fetch_all else 1
+        truncated = False
+
+        async with self._client() as client:
+            for _ in range(pages):
+                if url in seen_urls:
+                    # Self-referential `next`: stop rather than loop. We were
+                    # told more exists but can't safely reach it, so this is
+                    # an incomplete answer, not a finished one.
+                    truncated = True
+                    break
+                seen_urls.add(url)
+
+                response = await client.get(url, headers=self._headers(), params=params)
+                params = None  # the `next` URL already carries the query
+
+                if response.status_code in (401, 403):
+                    raise RuntimeError(
+                        "Okta refused the user search. This API token may lack user "
+                        "read access across the directory, which is broader than "
+                        "reading a single known user."
+                    )
+                if response.status_code == 400:
+                    # Okta answers 400 for a filter it can't parse. Its raw body
+                    # is not actionable, and the expression is ours, so name that.
+                    raise RuntimeError(
+                        "Okta rejected the search expression. This is a bug in how "
+                        "the search filter is built, not something a different name "
+                        "will fix."
+                    )
+                response.raise_for_status()
+
+                page = response.json()
+                users.extend(page)
+
+                next_url = response.links.get("next", {}).get("url")
+                if not next_url:
+                    break
+                url = next_url
+            else:
+                # Ran out of page budget with a `next` still outstanding. A
+                # hard bound keeps a looping `next` from hanging the CLI, but
+                # the answer is incomplete and must say so.
+                truncated = True
+
+        if not fetch_all:
+            truncated = len(users) >= MAX_SEARCH_RESULTS
+        return users, truncated
+
     async def _call_apps_backend(self, okta_id: str) -> list[dict]:
         if self.mock_mode:
             return self._mock_apps_fixture()
@@ -631,6 +808,21 @@ class OktaPlugin(ConnectorPlugin):
             }
         ]
 
+    def _mock_search_fixture(self) -> list[dict]:
+        """Three hits including a deactivated one, so the mock demo shows the
+        chooser and the case the feature exists for rather than a single hit."""
+        return [
+            {"id": "00uMOCK1", "status": "ACTIVE",
+             "profile": {"login": "dluo", "firstName": "Dennis", "lastName": "Luo",
+                         "email": "dluo@example.com"}},
+            {"id": "00uMOCK2", "status": "DEPROVISIONED",
+             "profile": {"login": "dcarter", "firstName": "Dennis", "lastName": "Carter",
+                         "email": "dcarter@example.com"}},
+            {"id": "00uMOCK3", "status": "ACTIVE",
+             "profile": {"login": "mdennison", "firstName": "Marta", "lastName": "Dennison",
+                         "email": "mdennison@example.com"}},
+        ]
+
     def _mock_apps_fixture(self) -> list[dict]:
         return [
             {
@@ -668,6 +860,19 @@ class OktaPlugin(ConnectorPlugin):
         ]
 
     # -- shaping --------------------------------------------------------------
+
+    @staticmethod
+    def _to_match(user: dict) -> dict:
+        """One search candidate: only what the chooser needs to let someone
+        pick, plus the status that usually settles which one they meant."""
+        profile = user.get("profile") or {}
+        names = [profile.get("firstName"), profile.get("lastName")]
+        return {
+            "login": profile.get("login"),
+            "name": " ".join(part for part in names if part) or None,
+            "email": profile.get("email"),
+            "status": user.get("status"),
+        }
 
     @staticmethod
     def _to_app(entry: dict) -> dict:
@@ -810,6 +1015,21 @@ class OktaPlugin(ConnectorPlugin):
                 help="List authenticators (MFA factors) this user has enrolled, "
                 "including inactive ones.",
             ),
+            find: bool = typer.Option(
+                False,
+                "--find",
+                help="Search for a person by name instead of looking one up. "
+                "Use when you know their first or surname but not their Okta "
+                "username. Long-only and cannot be combined with the section "
+                "flags -- it finds a person, it does not describe one.",
+            ),
+            show_all: bool = typer.Option(
+                False,
+                "--all",
+                help="With --find, show every match instead of the first "
+                "screenful, following pagination. Long-only: -a already means "
+                "applications.",
+            ),
             last_signin: bool = typer.Option(
                 False,
                 "--last-signin",
@@ -824,7 +1044,43 @@ class OktaPlugin(ConnectorPlugin):
                 "System Log data for about 90 days, which is the maximum.",
             ),
         ) -> None:
-            """Look one person up in Okta."""
+            """Look one person up in Okta, or search for them by name."""
+            # --find is a mode, not a section: it answers "who is this
+            # person", while every section flag answers "what do you want to
+            # see about this person". There is nothing to describe until one
+            # has been picked, so the combination is rejected rather than
+            # silently dropping the section the user typed -- which is the
+            # failure mode this CLI keeps designing out.
+            if find:
+                conflicting = [
+                    name
+                    for name, on in (
+                        ("--status", status), ("--devices", devices), ("--apps", apps),
+                        ("--authenticators", authenticators), ("--last-signin", last_signin),
+                    )
+                    if on
+                ]
+                if conflicting:
+                    console.print(
+                        f"[red]--find cannot be combined with[/red] {', '.join(conflicting)}[red].[/red]\n"
+                        "--find locates a person; the section flags describe one already found.\n"
+                        f"Find the username first, then: [bold]lookup-cli okta <username> "
+                        f"{conflicting[0]}[/bold]"
+                    )
+                    raise typer.Exit(code=2)
+                _print_search(identifier, fetch_all=show_all)
+                return
+
+            if show_all:
+                # --all modifies the search; there is no search to modify.
+                # Accepting it silently would leave someone believing they
+                # had asked for something.
+                console.print(
+                    "[red]--all only applies to --find.[/red]\n"
+                    f"Did you mean: [bold]lookup-cli okta --find {identifier} --all[/bold]?"
+                )
+                raise typer.Exit(code=2)
+
             # Asking for per-device sign-ins obviously means you want the
             # device table; requiring -d as well would just be pedantry.
             if last_signin:
@@ -854,6 +1110,15 @@ class OktaPlugin(ConnectorPlugin):
 
             if not result.data.get("found"):
                 console.print(f"[yellow]No Okta account found for[/yellow] {identifier}")
+                # A hint, not an implicit fallback: --find stays explicit and
+                # the miss path stays one API call. Without this, someone who
+                # does not know --find exists still hits a dead end -- and not
+                # knowing the username is exactly the situation in which you
+                # would not know the flag either.
+                console.print(
+                    f"[dim]Try:[/dim] [bold]lookup-cli okta --find {identifier}[/bold]"
+                    "[dim]   to search by name[/dim]"
+                )
                 return
 
             okta_id = result.properties.get("okta_id")
@@ -869,6 +1134,82 @@ class OktaPlugin(ConnectorPlugin):
 
             if authenticators:
                 _print_authenticators(identifier, okta_id=okta_id, primary=sole_section)
+
+        def _print_search(query: str, fetch_all: bool = False) -> None:
+            """Candidate chooser for `--find`.
+
+            Deliberately the same shape as the CAIRO connector's vendor
+            chooser: same problem (fuzzy input, several candidates, never
+            guess), so an operator learns one idiom rather than two. It is
+            reimplemented rather than shared because `plugins/CLAUDE.md`
+            forbids importing across plugin packages -- extracting this into
+            core is a bigger decision than a connector task should make, and
+            is logged in docs/STAGES.md instead.
+            """
+            result = asyncio.run(self.fetch_search(query, fetch_all=fetch_all))
+
+            if not result.ok:
+                console.print(f"[red]Okta search failed:[/red] {result.error}")
+                raise typer.Exit(code=1)
+
+            matches = result.data["matches"]
+            if not matches:
+                console.print(f"[yellow]No Okta user matches[/yellow] {query}")
+                console.print(
+                    "[dim]Search matches the start of a first name, surname, login or "
+                    "email -- so 'dennis' finds Dennis, but 'ennis' finds nobody. "
+                    "Multiple words narrow: 'dennis luo' needs both to match.[/dim]"
+                )
+                return
+
+            shown = matches if fetch_all else matches[:MAX_MATCHES_SHOWN]
+            console.print(
+                f"[yellow]{result.data['count']} "
+                f"{'person' if result.data['count'] == 1 else 'people'} match[/yellow] "
+                f"'{query}'[yellow]:[/yellow]"
+            )
+
+            table = Table()
+            # Login never wraps: it is the value you copy into the next
+            # command, and a truncated username is worse than useless.
+            table.add_column("username", no_wrap=True)
+            table.add_column("name")
+            table.add_column("email")
+            table.add_column("status", no_wrap=True)
+            for match in shown:
+                status_value = match["status"] or "UNKNOWN"
+                colour, _note = _STATUS_NOTES.get(status_value, ("yellow", ""))
+                table.add_row(
+                    match["login"] or "-",
+                    match["name"] or "-",
+                    match["email"] or "-",
+                    f"[{colour}]{status_value}[/{colour}]",
+                )
+            console.print(table)
+
+            if len(matches) > len(shown):
+                # Never truncate silently -- a short list reads as "that's all"
+                # -- and always name the way out. Telling someone to narrow
+                # without mentioning --all repeats the dead end that the
+                # --find hint exists to prevent.
+                console.print(
+                    f"[yellow]{len(matches) - len(shown)} more not shown[/yellow] - "
+                    "narrow the search (try adding a surname), or use [bold]--all[/bold]"
+                )
+            if result.data["truncated"]:
+                console.print(
+                    "[yellow]Okta may be holding more matches than it returned[/yellow] - "
+                    + ("narrow the search to be sure you are seeing everyone."
+                       if fetch_all else
+                       "narrow the search, or use [bold]--all[/bold] to follow pagination.")
+                )
+
+            # Make the two-step flow copy-paste rather than retype.
+            example = shown[0]["login"] or "<username>"
+            console.print(
+                f"[dim]Then:[/dim] [bold]lookup-cli okta {example} -sdau[/bold]"
+                "[dim]   (or -s / -d / -a / -u)[/dim]"
+            )
 
         def _print_status(identifier: str, result: ConnectorResult) -> None:
             status_value = result.data.get("status") or "UNKNOWN"

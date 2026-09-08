@@ -957,3 +957,326 @@ def test_the_security_question_text_never_reaches_the_terminal():
 
     assert "Security question" in out
     assert "Favourite art?" not in out
+
+
+# --- --find : long-only, and deliberately not chainable -------------------------
+#
+# Short flags here are section selectors and they compose (`-sdau`). Search is
+# not a section -- it answers "who is this person", not "what do you want to
+# see about this person" -- so it composes with nothing. Long-only makes every
+# bundled spelling a parse error for free; `--find -d` is caught at runtime.
+
+
+def _search_payload(*users):
+    return list(users)
+
+
+def _found_user(login, first, last, status="ACTIVE", uid="00u1"):
+    return {
+        "id": uid,
+        "status": status,
+        "profile": {
+            "login": login,
+            "firstName": first,
+            "lastName": last,
+            "email": f"{login}@example.com",
+        },
+    }
+
+
+def _mock_search(*users):
+    return respx.get(USERS_URL).mock(return_value=httpx.Response(200, json=list(users)))
+
+
+DENNISES = (
+    _found_user("dluo", "Dennis", "Luo", uid="00u1"),
+    _found_user("dcarter", "Dennis", "Carter", status="DEPROVISIONED", uid="00u2"),
+    _found_user("mdennison", "Marta", "Dennison", uid="00u3"),
+)
+
+
+@respx.mock
+def test_find_lists_candidates_with_their_usernames():
+    _mock_search(*DENNISES)
+
+    result = runner.invoke(_app(), ["okta", "--find", "dennis"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    for login in ("dluo", "dcarter", "mdennison"):
+        assert login in out
+
+
+@respx.mock
+def test_find_shows_each_candidates_status():
+    """Often enough to answer the question without a second command, and it
+    is what distinguishes two people with the same first name."""
+    _mock_search(*DENNISES)
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "dennis"]))
+
+    assert "ACTIVE" in out
+    assert "DEPROVISIONED" in out
+
+
+@respx.mock
+def test_find_works_with_the_query_after_the_flag_or_before_it():
+    _mock_search(*DENNISES)
+    after = _out(runner.invoke(_app(), ["okta", "--find", "dennis"]))
+    _mock_search(*DENNISES)
+    before = _out(runner.invoke(_app(), ["okta", "dennis", "--find"]))
+
+    assert "dluo" in after
+    assert "dluo" in before
+
+
+@respx.mock
+def test_find_prints_a_copy_pasteable_next_command():
+    """The two-step flow should be copy-paste, not retype."""
+    _mock_search(*DENNISES)
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "dennis"]))
+
+    assert "lookup-cli okta" in out
+
+
+@respx.mock
+def test_find_does_not_do_an_exact_lookup_first():
+    """`--find` is explicit: go straight to search, one call not two."""
+    exact = respx.get(f"{USERS_URL}/dennis").mock(
+        return_value=httpx.Response(200, json=_user_payload())
+    )
+    _mock_search(*DENNISES)
+
+    runner.invoke(_app(), ["okta", "--find", "dennis"])
+
+    assert not exact.called
+
+
+@respx.mock
+def test_find_never_auto_resolves_a_single_match():
+    """One candidate is not the same claim as the right person."""
+    _mock_search(_found_user("mdennison", "Marta", "Dennison"))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "dennison"]))
+
+    assert "mdennison" in out
+    # Must be the chooser, not a status page for that person.
+    assert "last_login" not in out
+
+
+@respx.mock
+def test_find_with_no_matches_says_so():
+    _mock_search()
+
+    result = runner.invoke(_app(), ["okta", "--find", "zzzznothing"])
+
+    assert result.exit_code == 0
+    assert "no" in _out(result).lower()
+
+
+# --- --all : show everything, not just the first page ---------------------------
+
+
+def _many(n):
+    return [_found_user(f"dperson{i:03d}", "D", f"Person{i}", uid=f"00u{i}") for i in range(n)]
+
+
+@respx.mock
+def test_without_all_the_display_is_capped():
+    from okta_plugin.plugin import MAX_MATCHES_SHOWN
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d"]))
+
+    assert "47 people match" in out
+    assert f"dperson{MAX_MATCHES_SHOWN - 1:03d}" in out
+    assert f"dperson{MAX_MATCHES_SHOWN:03d}" not in out
+
+
+@respx.mock
+def test_the_cap_message_names_the_escape_hatch():
+    """Telling someone to narrow without mentioning --all repeats the dead
+    end that the --find hint exists to prevent."""
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d"]))
+
+    assert "32 more not shown" in out
+    assert "--all" in out
+
+
+@respx.mock
+def test_all_shows_every_match():
+    _mock_search(*_many(47))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "d", "--all"]))
+
+    assert "dperson000" in out
+    assert "dperson046" in out
+    assert "more not shown" not in out
+
+
+@respx.mock
+def test_all_works_before_or_after_the_query():
+    _mock_search(*_many(20))
+    a = _out(runner.invoke(_app(), ["okta", "--find", "d", "--all"]))
+    _mock_search(*_many(20))
+    b = _out(runner.invoke(_app(), ["okta", "--all", "--find", "d"]))
+
+    assert "dperson019" in a
+    assert "dperson019" in b
+
+
+def test_all_without_find_is_a_usage_error():
+    """--all modifies the search; there is no search to modify. Accepting it
+    silently would leave someone believing they had asked for something."""
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "--all"])
+
+    assert result.exit_code == 2
+    assert "--all" in _out(result)
+
+
+def test_all_combined_with_a_section_flag_is_a_usage_error():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "jdoe", "--all", "-d"])
+
+    assert result.exit_code == 2
+
+
+def test_all_has_no_short_flag():
+    """`-a` already means apps. A short --all would be genuinely ambiguous."""
+    assert runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "--find", "-all"]).exit_code == 2
+
+
+@respx.mock
+def test_multi_token_search_narrows_from_the_cli():
+    """The advice the cap message gives has to actually work."""
+    route = _mock_search(_found_user("dluo", "Dennis", "Luo"))
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "dennis luo"]))
+
+    assert "dluo" in out
+    assert " and " in route.calls.last.request.url.params["search"]
+
+
+# --- Not chainable -----------------------------------------------------------
+
+
+def test_find_has_no_short_flag():
+    """`-f` is deliberately not declared. Declaring it would let `--find`
+    bundle with the section flags and imply it composes with them."""
+    assert runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "-f"]).exit_code == 2
+
+
+@pytest.mark.parametrize("bundle", ["-sdf", "-fd", "-sf", "-fa", "-sdauf"])
+def test_no_bundled_spelling_of_find_parses(bundle):
+    assert runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", bundle]).exit_code == 2
+
+
+@pytest.mark.parametrize("section", ["-s", "-d", "-a", "-u", "--devices", "-sdau"])
+def test_find_combined_with_a_section_flag_is_a_usage_error(section):
+    """Silently ignoring a flag the user typed is the failure mode this CLI
+    keeps designing out, so this errors rather than dropping the section."""
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "--find", section])
+
+    assert result.exit_code == 2
+
+
+@respx.mock
+def test_the_conflict_error_says_what_to_do_instead():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "--find", "-d"])
+
+    out = _out(result)
+    assert "--find" in out
+    assert "lookup-cli okta" in out, "should show the two-step command"
+
+
+def test_find_combined_with_last_signin_is_also_rejected():
+    """--last-signin is a section modifier; there is no section to modify."""
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "dennis", "--find", "--last-signin"])
+
+    assert result.exit_code == 2
+
+
+# --- The discoverability hint ---------------------------------------------------
+
+
+@respx.mock
+def test_a_failed_exact_lookup_points_at_find():
+    """Without this, someone who does not know --find exists still hits a
+    dead end -- and not knowing the username is exactly the situation where
+    you would not know the flag either."""
+    respx.get(f"{USERS_URL}/dennis").mock(return_value=httpx.Response(404))
+
+    result = runner.invoke(_app(), ["okta", "dennis"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    assert "--find" in out
+    assert "dennis" in out
+
+
+@respx.mock
+def test_the_hint_does_not_run_a_search_itself():
+    """It is a hint, not an implicit fallback: `--find` stays explicit and
+    the miss path stays one API call."""
+    respx.get(f"{USERS_URL}/dennis").mock(return_value=httpx.Response(404))
+    search = respx.get(USERS_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    runner.invoke(_app(), ["okta", "dennis"])
+
+    assert not search.called
+
+
+@respx.mock
+def test_a_successful_lookup_shows_no_hint():
+    _mock_user()
+
+    out = _out(runner.invoke(_app(), ["okta", "jdoe"]))
+
+    assert "--find" not in out
+
+
+# --- Help, layout, failures ------------------------------------------------------
+
+
+def test_help_documents_find_as_long_only():
+    out = _out(runner.invoke(_app(), ["okta", "--help"]))
+
+    assert "--find" in out
+
+
+@respx.mock
+def test_a_search_failure_exits_non_zero():
+    respx.get(USERS_URL).mock(return_value=httpx.Response(403))
+
+    assert runner.invoke(_app(), ["okta", "--find", "dennis"]).exit_code == 1
+
+
+@respx.mock
+def test_the_chooser_stays_readable_at_80_columns():
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_search(*DENNISES)
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["okta", "--find", "dennis"]).stdout)
+
+    assert "dcarter" in out, "username must never be squeezed out"
+    assert "DEPROVISIONED" in out
+
+
+@respx.mock
+def test_a_truncated_result_set_says_so_rather_than_looking_complete():
+    from okta_plugin.plugin import MAX_SEARCH_RESULTS
+    _mock_search(*[_found_user(f"user{i:03d}", "A", "B", uid=f"00u{i}")
+                   for i in range(MAX_SEARCH_RESULTS)])
+
+    out = _out(runner.invoke(_app(), ["okta", "--find", "a"]))
+
+    assert "more" in out.lower() or "narrow" in out.lower()
+
+
+def test_mock_mode_end_to_end_with_find():
+    result = runner.invoke(_app(MOCK_CONFIG), ["okta", "--find", "dennis"])
+
+    assert result.exit_code == 0
+    assert "DEPROVISIONED" in _out(result)
