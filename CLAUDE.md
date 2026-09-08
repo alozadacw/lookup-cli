@@ -170,6 +170,7 @@ lookup-cli okta <user> -d                 # devices only;  -sd for both
 lookup-cli okta <user> -a                 # applications;  -apps / --apps
 lookup-cli okta <user> -u                 # authenticators; -authenticators
 lookup-cli okta <user> -sdau              # all four sections
+lookup-cli okta --find <name>             # search by name -> usernames (not chainable)
 lookup-cli cairo <name>                   # CAIRO/TPRM vendor + its applications
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
@@ -200,6 +201,12 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
     sign-in times from the System Log)
   - `-a`/`-apps`/`--apps` — assigned applications
   - `-u`/`-authenticators`/`--authenticators` — enrolled MFA factors
+  - `--find` — resolve a partial name to a username. **Long-only and
+    composes with nothing** (it is a mode, not a section); combining it with
+    a section flag is a usage error. ⚠️ Okta's List Users endpoint excludes
+    `DEPROVISIONED` users by default — no status clause is sent and a test
+    pins that, but whether the API honours it is unverified against a real
+    org. See the CLI shape note and Stage 2 notes in `docs/STAGES.md`.
 
   **CLI shape is `<service> <identifier> [flags]` for every connector** —
   no noun subcommands, and flags bundle (`-sdau`). Read the CLI shape note
@@ -219,7 +226,7 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
   the explicit plugin list documented there. Three separate `status`-ish
   fields exist on this API and mean different things; see the CAIRO section
   of `docs/STAGES.md` before touching them.
-- Whole suite: 361 tests, 98% coverage, single `pytest` run.
+- Whole suite: 428 tests, 98% coverage, single `pytest` run.
 - Stages 3-8: not started. Both contract decisions (async `fetch()`,
   injected `PluginConfig`) are resolved and implemented, so Jira (Stage 3)
   is a straight copy of the Okta shape.
