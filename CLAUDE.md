@@ -175,6 +175,7 @@ lookup-cli okta --find "first last"       # multiple words narrow (AND)
 lookup-cli okta --find <name> --all       # every match, not just the first 15
 lookup-cli jira <user>                    # assigned issues;  -r reported;  -tr both
 lookup-cli jira <user> --all              # page the cursor for a real count
+lookup-cli jira ENG-123                   # one issue by key (auto-detected)
 lookup-cli cairo <name>                   # CAIRO/TPRM vendor + its applications
 lookup-cli lookup <identifier>            # once Stage 7 lands
 ```
@@ -236,7 +237,7 @@ Marker runs cover plugin packages too, so `pytest -m okta` will include
   is 410 Gone, unbounded JQL is refused, and the replacement returns **no
   `total`** -- so a count is only real when `complete` is true, otherwise
   the CLI says "at least N". JQL needs an accountId, never a username.
-- Whole suite: 508 tests, 98% coverage, single `pytest` run.
+- Whole suite: 561 tests, 98% coverage, single `pytest` run.
 - Stages 3-8: not started. Both contract decisions (async `fetch()`,
   injected `PluginConfig`) are resolved and implemented, so Jira (Stage 3)
   is a straight copy of the Okta shape.

@@ -34,6 +34,17 @@ Reported is historical. On the real instance the two differ substantially
 for the same person, so they are shown under separate headings and never
 merged into one count.
 
+**Looking up one issue.** `lookup-cli jira ENG-1` shows a single ticket.
+The identifier is normally a person, but an issue key is distinctive enough
+(`ABC-123`) to detect without guessing -- an email always carries an `@`,
+and a display name never has the letters-hyphen-digits shape. Detection is
+case-insensitive because Jira itself is: the API answers 200 for
+`eng-42` as readily as the uppercase spelling.
+
+There is deliberately no fallback from a failed key lookup to a person
+search. A string shaped like an issue key that Jira does not know is a
+typo, not a colleague.
+
 Required env vars (see `.env.example`):
     JIRA_BASE_URL       e.g. https://your-org.atlassian.net
     JIRA_EMAIL          the account the API token belongs to
@@ -47,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 
 import httpx
 import typer
@@ -80,6 +92,72 @@ _MAX_PAGES = 20
 _ISSUE_FIELDS = "key,summary,status,project,priority,updated"
 
 _STATUS_COLOURS = {"Done": "green", "In Progress": "yellow", "To Do": "cyan"}
+
+#: Jira project keys are letters then letters/digits/underscore; the issue
+#: number is decimal. Matched case-insensitively because Jira resolves
+#: lowercase keys too -- a case-sensitive pattern would send `eng-1` down the
+#: person-search path and fail confusingly.
+_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
+
+#: Fields fetched for a single issue. The untrimmed response is ~46KB on the
+#: live instance -- roughly 90 custom fields plus comments, worklog and
+#: attachments -- and everything in `data` reaches the plaintext local cache.
+_SINGLE_ISSUE_FIELDS = (
+    "summary,status,project,issuetype,priority,assignee,reporter,creator,"
+    "created,updated,resolution,labels,description"
+)
+
+#: Description text is truncated in the table; the full body can run to
+#: thousands of characters.
+DESCRIPTION_WIDTH = 400
+
+
+def looks_like_issue_key(value: str | None) -> bool:
+    """True if `value` is shaped like an issue key rather than a person."""
+    return bool(_ISSUE_KEY_RE.match((value or "").strip()))
+
+
+#: ADF nodes that end a line of prose. Their text must not run into whatever
+#: follows -- joining blocks with nothing produced "instance:1. Add/set up"
+#: from a real ticket, welding a sentence end onto the next paragraph.
+_ADF_BLOCK_TYPES = frozenset({
+    "paragraph", "heading", "listItem", "blockquote", "codeBlock",
+    "panel", "rule", "tableRow", "tableCell", "tableHeader", "mediaSingle",
+})
+
+
+def flatten_adf(node: object) -> str | None:
+    """Plain text from an Atlassian Document Format body.
+
+    API v3 returns descriptions as a nested ADF document rather than a
+    string, so the raw value is unreadable JSON. This walks the tree keeping
+    text nodes; unknown node types contribute nothing rather than raising,
+    since Atlassian keeps adding them.
+
+    Block-level nodes emit a trailing space so adjacent paragraphs and list
+    items stay separate words, while inline runs inside one paragraph (a
+    bold span mid-sentence, say) are concatenated -- a space there would
+    break words apart.
+
+    Returns None rather than "" for an empty document, so the CLI can show
+    "no description" distinctly from an empty one.
+    """
+
+    def walk(item: object) -> str:
+        if isinstance(item, list):
+            return "".join(walk(child) for child in item)
+        if not isinstance(item, dict):
+            return ""
+        node_type = item.get("type")
+        if node_type == "text":
+            return str(item.get("text") or "")
+        if node_type == "hardBreak":
+            return " "
+        inner = "".join(walk(child) for child in item.get("content") or [])
+        return f"{inner} " if node_type in _ADF_BLOCK_TYPES else inner
+
+    text = " ".join(walk(node).split())
+    return text or None
 
 
 def build_jql(relationship: str, account_id: str) -> str:
@@ -165,6 +243,43 @@ class JiraPlugin(ConnectorPlugin):
             tags=["no-issues"] if not issues else ["has-issues"],
         )
 
+    async def fetch_issue(self, key: str) -> ConnectorResult:
+        """One issue by key. Never raises for ordinary failures."""
+        try:
+            raw = await self._call_issue_backend(key.strip())
+        except Exception as exc:  # noqa: BLE001 - contract: never crash aggregation
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=key,
+                error=safe_error(exc, secrets=[self.config.get("JIRA_API_TOKEN")]),
+            )
+
+        if raw is None:
+            return ConnectorResult(
+                plugin_name=self.name,
+                identifier=key,
+                data={
+                    "found": False,
+                    "issue": None,
+                    # Jira answers 404 both for issues that do not exist and
+                    # for issues the caller cannot see -- deliberately, so
+                    # existence is not leaked. Saying only "no such issue"
+                    # would send someone hunting for a typo that isn't there.
+                    "not_found_reason": (
+                        "no such issue, or this account lacks permission to view it"
+                    ),
+                },
+                tags=["not-found"],
+            )
+
+        return ConnectorResult(
+            plugin_name=self.name,
+            identifier=key,
+            data={"found": True, "issue": self._to_full_issue(raw), "not_found_reason": None},
+            properties={"issue_id": raw.get("id")},
+            tags=["issue"],
+        )
+
     def _not_found(self, identifier: str) -> ConnectorResult:
         return ConnectorResult(
             plugin_name=self.name,
@@ -186,6 +301,21 @@ class JiraPlugin(ConnectorPlugin):
                 url, headers=self._headers(), params={"query": identifier, "maxResults": "10"}
             )
         self._raise_for_auth(response)
+        response.raise_for_status()
+        return response.json()
+
+    async def _call_issue_backend(self, key: str) -> dict | None:
+        if self.mock_mode:
+            return self._mock_single_issue_fixture()
+
+        url = f"{self._base_url()}/rest/api/3/issue/{key}"
+        async with self._client() as client:
+            response = await client.get(
+                url, headers=self._headers(), params={"fields": _SINGLE_ISSUE_FIELDS}
+            )
+        self._raise_for_auth(response)
+        if response.status_code == 404:
+            return None
         response.raise_for_status()
         return response.json()
 
@@ -283,6 +413,25 @@ class JiraPlugin(ConnectorPlugin):
                 "priority": {"name": "Medium"}, "updated": "2026-08-20T09:00:00.000+0000"}},
         ]
 
+    def _mock_single_issue_fixture(self) -> dict:
+        return {"id": "10001", "key": "MOCK-1", "fields": {
+            "summary": "Mock: cloud console admin access",
+            "status": {"name": "Blocked", "statusCategory": {"name": "In Progress"}},
+            "project": {"key": "MOCK", "name": "Mock Project"},
+            "issuetype": {"name": "Task"},
+            "priority": {"name": "High"},
+            "assignee": {"displayName": "Mock Dana Example"},
+            "reporter": {"displayName": "Mock Ravi Patel"},
+            "creator": {"displayName": "Mock Ravi Patel"},
+            "created": "2026-08-01T09:00:00.000+0000",
+            "updated": "2026-09-08T14:00:00.000+0000",
+            "resolution": None,
+            "labels": ["access", "cloud"],
+            "description": {"type": "doc", "version": 1, "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "Mock: please provision staging access."}]}]},
+        }}
+
     # -- shaping --------------------------------------------------------------
 
     @staticmethod
@@ -296,6 +445,31 @@ class JiraPlugin(ConnectorPlugin):
             # asking about, so this is carried rather than filtered on.
             "active": account.get("active"),
         }
+
+    @classmethod
+    def _to_full_issue(cls, issue: dict) -> dict:
+        """One issue in detail. Reporter and creator are kept separate: a
+        ticket raised on a colleague's behalf has different people in each,
+        and for a tool about people that difference is the interesting part."""
+        fields = issue.get("fields") or {}
+
+        def person(key: str) -> str | None:
+            value = fields.get(key) or {}
+            return value.get("displayName")
+
+        base = cls._to_issue(issue)
+        base.update({
+            "issue_type": (fields.get("issuetype") or {}).get("name"),
+            "project_name": (fields.get("project") or {}).get("name"),
+            "assignee": person("assignee"),
+            "reporter": person("reporter"),
+            "creator": person("creator"),
+            "created": (fields.get("created") or "")[:10] or None,
+            "resolution": (fields.get("resolution") or {}).get("name"),
+            "labels": fields.get("labels") or [],
+            "description": flatten_adf(fields.get("description")),
+        })
+        return base
 
     @staticmethod
     def _to_issue(issue: dict) -> dict:
@@ -324,7 +498,9 @@ class JiraPlugin(ConnectorPlugin):
         @sub_app.callback(invoke_without_command=True)
         def jira(
             identifier: str = typer.Argument(
-                ..., help="Email address or display name of the person."
+                ...,
+                help="Email address or display name of a person, or an issue "
+                "key like ENG-123.",
             ),
             tickets: bool = typer.Option(
                 False, "--tickets", "-tickets", "-t",
@@ -342,7 +518,27 @@ class JiraPlugin(ConnectorPlugin):
                 "'at least N' rather than a count.",
             ),
         ) -> None:
-            """Look one person's Jira issues up."""
+            """Look up a person's Jira issues, or one issue by key."""
+            # An issue key is a different question, not a different view of
+            # the same one, so it dispatches before any section logic. The
+            # section flags describe a person's workload and mean nothing
+            # for a single ticket -- rejected rather than silently dropped.
+            if looks_like_issue_key(identifier):
+                unusable = [
+                    name for name, on in
+                    (("--tickets", tickets), ("--reported", reported), ("--all", show_all))
+                    if on
+                ]
+                if unusable:
+                    console.print(
+                        f"[red]{', '.join(unusable)} cannot be used with an issue key.[/red]\n"
+                        f"{identifier} is one ticket; those flags select a person's issues.\n"
+                        f"Did you mean: [bold]lookup-cli jira {identifier}[/bold]?"
+                    )
+                    raise typer.Exit(code=2)
+                _print_issue(identifier)
+                return
+
             # Flags select sections. With none given, assigned is what people
             # want; `-r` alone means reported only.
             show_assigned = tickets or not reported
@@ -389,6 +585,60 @@ class JiraPlugin(ConnectorPlugin):
                         raise typer.Exit(code=1)
                     return
                 _print_issues(second.data, primary=sole_section, fetch_all=show_all)
+
+        def _print_issue(key: str) -> None:
+            result = asyncio.run(self.fetch_issue(key))
+
+            if not result.ok:
+                console.print(f"[red]Jira lookup failed:[/red] {result.error}")
+                raise typer.Exit(code=1)
+
+            if not result.data["found"]:
+                console.print(
+                    f"[yellow]No Jira issue[/yellow] {key} [yellow]-[/yellow] "
+                    f"{result.data['not_found_reason']}."
+                )
+                return
+
+            issue = result.data["issue"]
+            colour = _STATUS_COLOURS.get(issue["status_category"], "yellow")
+            console.print(
+                f"[bold]{issue['key']}[/bold]  [{colour}]{issue['status'] or '-'}[/{colour}]\n"
+                f"{issue['summary'] or '-'}"
+            )
+
+            table = Table(show_header=False)
+            table.add_column("field", no_wrap=True)
+            table.add_column("value")
+            rows = [
+                ("type", issue["issue_type"]),
+                ("project", f"{issue['project']} ({issue['project_name']})"
+                            if issue["project_name"] else issue["project"]),
+                ("priority", issue["priority"]),
+                ("assignee", issue["assignee"] or "[yellow]unassigned[/yellow]"),
+                ("reporter", issue["reporter"]),
+            ]
+            # Only when it differs: a ticket raised on someone's behalf has a
+            # different creator, and that is worth seeing. Showing it always
+            # would just be a duplicate row on most tickets.
+            if issue["creator"] and issue["creator"] != issue["reporter"]:
+                rows.append(("creator", issue["creator"]))
+            rows += [
+                ("created", issue["created"]),
+                ("updated", issue["updated"]),
+                ("resolution", issue["resolution"]),
+                ("labels", ", ".join(issue["labels"]) if issue["labels"] else None),
+            ]
+            for label, value in rows:
+                table.add_row(label, str(value) if value else "-")
+            console.print(table)
+
+            if issue["description"]:
+                body = issue["description"]
+                if len(body) > DESCRIPTION_WIDTH:
+                    cut = body[:DESCRIPTION_WIDTH]
+                    body = cut[: cut.rindex(" ")] + "\u2026" if " " in cut else cut + "\u2026"
+                console.print(f"\n[dim]description[/dim]\n{body}")
 
         def _print_account(account: dict) -> None:
             state = "" if account.get("active") else " [red](inactive)[/red]"

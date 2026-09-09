@@ -304,6 +304,148 @@ def test_an_inactive_jira_account_is_called_out():
     assert "inactive" in out.lower() or "deactivated" in out.lower()
 
 
+# --- Looking a ticket up by key ------------------------------------------------
+
+ISSUE_URL = f"{BASE}/rest/api/3/issue"
+
+
+def _adf(text):
+    return {"type": "doc", "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+
+
+def _full_issue(key="ENG-1"):
+    return {"id": "1", "key": key, "fields": {
+        "summary": "Cloud console admin access",
+        "status": {"name": "Blocked", "statusCategory": {"name": "In Progress"}},
+        "project": {"key": "ENG", "name": "Engineering"},
+        "issuetype": {"name": "Task"},
+        "priority": {"name": "High"},
+        "assignee": {"displayName": "Dana Example", "emailAddress": "dana@example.com"},
+        "reporter": {"displayName": "Ravi Patel", "emailAddress": "ravi@example.com"},
+        "creator": {"displayName": "Ravi Patel", "emailAddress": "ravi@example.com"},
+        "created": "2026-08-01T09:00:00.000+0000",
+        "updated": "2026-09-08T14:00:00.000+0000",
+        "resolution": None, "labels": ["access"],
+        "description": _adf("Please provision staging access."),
+    }}
+
+
+def _mock_issue(key="ENG-1", status=200, body=None):
+    return respx.get(f"{ISSUE_URL}/{key}").mock(
+        return_value=httpx.Response(status, json=body if body is not None else _full_issue(key)))
+
+
+@respx.mock
+def test_an_issue_key_is_looked_up_as_an_issue():
+    _mock_issue()
+
+    result = runner.invoke(_app(), ["jira", "ENG-1"])
+
+    assert result.exit_code == 0
+    out = _out(result)
+    assert "ENG-1" in out
+    assert "Cloud console admin access" in out
+
+
+@respx.mock
+def test_an_issue_key_does_not_trigger_a_person_search():
+    """The two paths are mutually exclusive; searching for a person named
+    'ENG-1' would be a confidently wrong answer."""
+    _mock_issue()
+    user_route = respx.get(USER_SEARCH_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    runner.invoke(_app(), ["jira", "ENG-1"])
+
+    assert not user_route.called
+
+
+@respx.mock
+def test_a_lowercase_key_still_reaches_the_issue_path():
+    _mock_issue("eng-1")
+    user_route = respx.get(USER_SEARCH_URL).mock(return_value=httpx.Response(200, json=[]))
+
+    result = runner.invoke(_app(), ["jira", "eng-1"])
+
+    assert result.exit_code == 0
+    assert not user_route.called
+
+
+@respx.mock
+def test_an_email_still_reaches_the_person_path():
+    _mock()
+    issue_route = respx.get(url__startswith=ISSUE_URL).mock(
+        return_value=httpx.Response(200, json=_full_issue()))
+
+    runner.invoke(_app(), ["jira", "dana@example.com"])
+
+    assert not issue_route.called
+
+
+@respx.mock
+def test_the_issue_view_shows_the_people_on_the_ticket():
+    """This is a tool about people; assignee and reporter are the fields
+    that let you pivot to another connector."""
+    _mock_issue()
+
+    out = _out(runner.invoke(_app(), ["jira", "ENG-1"]))
+
+    assert "Dana Example" in out
+    assert "Ravi Patel" in out
+
+
+@respx.mock
+def test_the_issue_view_shows_the_description():
+    _mock_issue()
+
+    out = _out(runner.invoke(_app(), ["jira", "ENG-1"]))
+
+    assert "Please provision staging access." in out
+
+
+@respx.mock
+def test_an_unknown_key_explains_it_may_be_a_permission_problem():
+    _mock_issue("ENG-9999", status=404, body={"errorMessages": ["Issue does not exist"]})
+
+    result = runner.invoke(_app(), ["jira", "ENG-9999"])
+
+    assert result.exit_code == 0
+    out = _out(result).lower()
+    assert "eng-9999" in out
+    assert "permission" in out
+
+
+@pytest.mark.parametrize("flag", ["-t", "-r", "-tr", "--all"])
+@respx.mock
+def test_section_flags_are_rejected_for_an_issue_key(flag):
+    """`-r` means "reported by this person" -- meaningless for a ticket.
+    Silently ignoring it would leave someone believing they asked for
+    something."""
+    _mock_issue()
+
+    result = runner.invoke(_app(), ["jira", "ENG-1", flag])
+
+    assert result.exit_code == 2
+    assert "ENG-1" in _out(result)
+
+
+@respx.mock
+def test_the_issue_view_stays_readable_at_80_columns():
+    narrow = CliRunner(env={"COLUMNS": "80", "NO_COLOR": "1", "TERM": "dumb"})
+    _mock_issue()
+
+    out = _ANSI.sub("", narrow.invoke(_app(), ["jira", "ENG-1"]).stdout)
+
+    assert "ENG-1" in out
+    assert "Dana Example" in out
+
+
+def test_mock_mode_end_to_end_with_an_issue_key():
+    result = runner.invoke(_app(MOCK_CONFIG), ["jira", "MOCK-1"])
+
+    assert result.exit_code == 0
+
+
 # --- Help, layout, mock mode -------------------------------------------------
 
 

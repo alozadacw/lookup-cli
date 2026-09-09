@@ -331,6 +331,7 @@ better than the Okta situation. (Account name omitted: this repo is public.)
 | [x] `--all` to page the cursor and get a real count | plugin implemented |
 | [x] **Live smoke test against real Jira** | service account in `.env` |
 | [x] Leave room in `properties` for future status/project filters | plugin implemented |
+| [x] `lookup-cli jira ENG-123` -- look one issue up by key | plugin implemented |
 
 Notes from the implementation -- all three API facts were found by probing
 the live instance, not from documentation:
@@ -359,6 +360,35 @@ the live instance, not from documentation:
   that needs reassigning when someone leaves, or that says what someone is
   stuck on. Reported is historical. They are shown under separate headings
   and never merged into one count.
+- **An issue key is auto-detected, not hidden behind a flag.** `jira ENG-1`
+  shows one ticket. The shapes are unambiguous -- an email always carries an
+  `@`, a display name never has the letters-hyphen-digits form -- so this is
+  detection rather than guessing. **Case-insensitive**, because the live API
+  answers 200 for `eng-42`; a case-sensitive pattern would send the
+  lowercase spelling down the person path and fail confusingly.
+  - **No fallback from a failed key to a person search.** A string shaped
+    like a key that Jira does not know is a typo, not a colleague.
+  - **404 means "missing *or* no permission"** and the message says so. Jira
+    deliberately does not distinguish, to avoid leaking issue existence, so
+    reporting only "no such issue" would send someone hunting for a typo
+    that isn't there.
+  - **Section flags are rejected for a key** (exit 2, with the corrected
+    command). `-r` means "reported by this person" and is meaningless for a
+    single ticket.
+  - **Reporter and creator are shown separately when they differ.** A ticket
+    raised on a colleague's behalf has different people in each, and for a
+    tool about people that is the interesting part. Identical values collapse
+    to one row rather than duplicating.
+  - **Descriptions are ADF, not text.** API v3 returns a nested Atlassian
+    Document Format tree; `flatten_adf()` walks it. Block-level nodes emit a
+    trailing space while inline runs concatenate -- joining everything with
+    nothing welded a sentence end onto the next paragraph
+    ("instance:1. Add/set up") on a real ticket. Unknown node types
+    contribute nothing rather than raising, since Atlassian keeps adding them.
+  - **Only rendered fields are requested**: the untrimmed issue is ~46KB
+    (about 90 custom fields plus comments, worklog, attachments) against 6KB
+    trimmed. Note descriptions routinely contain names and email addresses,
+    and `data` reaches the plaintext local cache.
 - **Several matching accounts is ambiguity, not a guess.** Picking the
   first would attribute someone else's tickets to the person asked about.
   A chooser is printed, same shape as `okta --find` and `cairo`.
